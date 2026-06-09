@@ -1,6 +1,7 @@
 {
-  "name": "ltv-watch",
+  "name": "defi-ltv",
   "version": "1.0.0",
+  "description": "Telegram bot for monitoring Health Factor / LTV of DeFi lending positions on Kamino (Solana) and Aave V3 (Ethereum, Arbitrum, Base)",
   "type": "module",
   "engines": {
     "node": ">=20"
