@@ -130,7 +130,7 @@ async function getCachedAaveMarkets(key) {
 }
 
 async function getAavePositionsForNetwork(key, walletAddress) {
-  const [accountData, userData, cachedMarkets] = await withRpcFallback(
+  const [accountData, userData, cachedMarkets, reservesData] = await withRpcFallback(
     key,
     async (provider) => {
       const { config, pool, ui } = createMarketClients(key, provider);
@@ -140,7 +140,10 @@ async function getAavePositionsForNetwork(key, walletAddress) {
           lendingPoolAddressProvider: config.POOL_ADDRESSES_PROVIDER,
           user: walletAddress
         }),
-        getCachedAaveMarkets(key)
+        getCachedAaveMarkets(key),
+        ui.getReservesHumanized({
+          lendingPoolAddressProvider: config.POOL_ADDRESSES_PROVIDER
+        })
       ]);
     }
   );
@@ -161,18 +164,30 @@ async function getAavePositionsForNetwork(key, walletAddress) {
   const marketByAsset = new Map(
     cachedMarkets.map((market) => [market.underlyingAsset.toLowerCase(), market])
   );
+  // variableBorrowRate is an APR expressed in ray (1e27). Convert to a percentage.
+  const borrowRateByAsset = new Map(
+    (reservesData?.reservesData || []).map((reserve) => [
+      reserve.underlyingAsset.toLowerCase(),
+      Math.round((Number(reserve.variableBorrowRate) / 1e27) * 100 * 100) / 100
+    ])
+  );
   const label = getNetworkConfig(key).label;
 
   return userData.userReserves
     .filter((reserve) => Number(reserve.scaledVariableDebt) > 0)
     .map((reserve) => {
-      const market = marketByAsset.get(reserve.underlyingAsset.toLowerCase());
+      const asset = reserve.underlyingAsset.toLowerCase();
+      const market = marketByAsset.get(asset);
       const marketLabel = market ? `${label} ${market.symbol}` : label;
+      const token = market ? market.symbol : "?";
+      const borrowRate = borrowRateByAsset.has(asset) ? borrowRateByAsset.get(asset) : null;
       return {
         market: marketLabel,
         ltv: currentLtv.toFixed(2),
         liquidationLtv: liquidationLtv.toFixed(2),
-        healthFactor: Math.round(healthFactor * 100) / 100
+        healthFactor: Math.round(healthFactor * 100) / 100,
+        borrows: borrowRate == null ? [] : [{ token, rate: borrowRate }],
+        borrowRate
       };
     });
 }

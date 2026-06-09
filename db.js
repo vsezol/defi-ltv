@@ -111,10 +111,8 @@ function mergeUsers(kaminoUser, aaveUser) {
       ...(kaminoUser?.wallets || {}),
       ...(aaveUser?.wallets || {})
     },
-    settings: {
-      kamino: kaminoUser?.settings?.kamino || {},
-      aave: aaveUser?.settings?.aave || {}
-    },
+    // Global default thresholds are user-wide; persisted in the Kamino store.
+    settings: kaminoUser?.settings || {},
     ui: kaminoUser?.ui || {}
   };
 }
@@ -135,13 +133,12 @@ function splitUser(user) {
 
   const kaminoUser = {
     wallets: kaminoWallets,
-    settings: { kamino: user?.settings?.kamino || {} },
+    settings: user?.settings || {},
     ui: user?.ui || {}
   };
 
   const aaveUser = {
-    wallets: aaveWallets,
-    settings: { aave: user?.settings?.aave || {} }
+    wallets: aaveWallets
   };
 
   return { kaminoUser, aaveUser };
@@ -160,7 +157,7 @@ export function setUser(chatId, user) {
 
   const hasKaminoData =
     Object.keys(kaminoUser.wallets).length > 0 ||
-    Object.keys(kaminoUser.settings.kamino || {}).length > 0 ||
+    Object.keys(kaminoUser.settings || {}).length > 0 ||
     Object.keys(kaminoUser.ui || {}).length > 0;
   if (hasKaminoData) {
     kaminoDb.users[chatId] = kaminoUser;
@@ -168,9 +165,7 @@ export function setUser(chatId, user) {
     delete kaminoDb.users[chatId];
   }
 
-  const hasAaveData =
-    Object.keys(aaveUser.wallets).length > 0 ||
-    Object.keys(aaveUser.settings.aave || {}).length > 0;
+  const hasAaveData = Object.keys(aaveUser.wallets).length > 0;
   if (hasAaveData) {
     aaveDb.users[chatId] = aaveUser;
   } else {

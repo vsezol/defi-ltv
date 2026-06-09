@@ -1,16 +1,21 @@
 # defi-ltv
 
-Telegram bot that monitors the **Health Factor (HF)** and **LTV** of your DeFi
-lending positions on **Kamino** (Solana) and **Aave V3** (Ethereum, Arbitrum,
-Base), and alerts you when a position drops to your Warning/Danger threshold.
+Telegram bot that monitors the **Health Factor (HF)**, **LTV** and **borrow rate**
+of your DeFi lending positions on **Kamino** (Solana) and **Aave V3** (Ethereum,
+Arbitrum, Base), and alerts you when a position crosses your Warning/Danger
+threshold.
 
 ## How it works
 
 - Add a wallet — the protocol is auto-detected from the address format
   (`0x…` → Aave, Solana base58 → Kamino).
 - Every 10 minutes it re-checks all positions and pings you on Telegram when
-  `HF ≤ Warning`.
-- Thresholds are per-user and per-protocol (defaults: Warning `1.5`, Danger `1.3`).
+  `HF ≤ Warning` **or** `borrow rate ≥ Warning`.
+- Thresholds are **per-wallet**: every wallet has its own Warning/Danger for HF
+  and for borrow rate. New wallets inherit user-wide **global defaults** (which you
+  can change) — Warning HF `1.5`, Danger HF `1.3`, Warning rate `10%`, Danger rate `15%`.
+- Borrow rate is the borrow APY. For a Kamino position that borrows several
+  assets, the **highest** asset borrow APY is used; for Aave it's the per-asset rate.
 
 It's a single Node.js process — no Docker, no database. State lives in local JSON
 files (`db-kamino.json`, `db-aave.json`), created on first run.
@@ -48,13 +53,19 @@ npm run dev            # loads .env automatically (--env-file=.env)
 
 ## Bot commands
 
-- `/menu` — open the interactive menu.
+All threshold commands take a target — a wallet address, its **index** from
+`/list`, or the keyword **`default`** (to change the global defaults).
+
+- `/menu` — open the interactive menu. Tap a wallet under **Wallets** to edit its
+  thresholds; **Settings** edits the global defaults.
 - `/add <wallet>` — add a wallet (protocol auto-detected).
 - `/remove <wallet>` — remove a wallet.
-- `/list` — list your wallets.
+- `/list` — list your wallets with their thresholds.
 - `/check [all|aave|kamino]` — check positions now.
 - `/refreshmarkets [all|aave|kamino]` — rescan markets for your wallets.
-- `/setwarning <value> [aave|kamino]` — set Warning HF (default `1.5`).
-- `/setdanger <value> [aave|kamino]` — set Danger HF (default `1.3`).
-- `/settings` — show current thresholds.
+- `/setwarning <wallet|index|default> <value>` — set Warning HF.
+- `/setdanger <wallet|index|default> <value>` — set Danger HF.
+- `/setratewarning <wallet|index|default> <value>` — set Warning borrow rate (%).
+- `/setratedanger <wallet|index|default> <value>` — set Danger borrow rate (%).
+- `/settings` — show global defaults and per-wallet thresholds.
 - `/stop` — stop monitoring and remove all wallets.

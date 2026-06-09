@@ -14,8 +14,22 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 
 const CHECK_INTERVAL = 10 * 60 * 1000;
-const WARNING_HEALTH_FACTOR = 1.5;
-const DANGER_HEALTH_FACTOR = 1.3;
+
+// Code-level fallbacks. Used when neither the wallet nor the global defaults set a value.
+const DEFAULT_WARNING_HEALTH_FACTOR = 1.5;
+const DEFAULT_DANGER_HEALTH_FACTOR = 1.3;
+const DEFAULT_WARNING_BORROW_RATE = 10; // %
+const DEFAULT_DANGER_BORROW_RATE = 15; // %
+
+// Maps short callback/command codes to threshold fields.
+// kind "hf"   -> alert when value is BELOW the threshold (lower health factor = riskier)
+// kind "rate" -> alert when value is ABOVE the threshold (higher borrow rate = costlier)
+const THRESHOLD_FIELDS = {
+  whf: { key: "warningHealthFactor", label: "Warning HF", kind: "hf" },
+  dhf: { key: "dangerHealthFactor", label: "Danger HF", kind: "hf" },
+  wbr: { key: "warningBorrowRate", label: "Warning Rate", kind: "rate" },
+  dbr: { key: "dangerBorrowRate", label: "Danger Rate", kind: "rate" }
+};
 
 loadDb();
 
@@ -54,18 +68,54 @@ function ensureUser(chatId) {
   if (!user) user = {};
   if (!user.wallets) user.wallets = {};
   if (!user.settings) user.settings = {};
-  if (!user.settings.kamino) user.settings.kamino = {};
-  if (!user.settings.aave) user.settings.aave = {};
   if (!user.ui) user.ui = {};
   return user;
 }
 
-function getThresholds(user, protocol) {
-  const settings = user?.settings?.[protocol] || {};
+// User-configurable global defaults, falling back to code constants.
+function getGlobalDefaults(user) {
+  const s = user?.settings || {};
   return {
-    warning: settings.warningHealthFactor ?? WARNING_HEALTH_FACTOR,
-    danger: settings.dangerHealthFactor ?? DANGER_HEALTH_FACTOR
+    warningHealthFactor: s.warningHealthFactor ?? DEFAULT_WARNING_HEALTH_FACTOR,
+    dangerHealthFactor: s.dangerHealthFactor ?? DEFAULT_DANGER_HEALTH_FACTOR,
+    warningBorrowRate: s.warningBorrowRate ?? DEFAULT_WARNING_BORROW_RATE,
+    dangerBorrowRate: s.dangerBorrowRate ?? DEFAULT_DANGER_BORROW_RATE
   };
+}
+
+// Effective thresholds for a wallet: per-wallet override -> global default -> constant.
+function getWalletThresholds(user, wallet) {
+  const defaults = getGlobalDefaults(user);
+  const w = user?.wallets?.[wallet]?.settings || {};
+  return {
+    warningHealthFactor: w.warningHealthFactor ?? defaults.warningHealthFactor,
+    dangerHealthFactor: w.dangerHealthFactor ?? defaults.dangerHealthFactor,
+    warningBorrowRate: w.warningBorrowRate ?? defaults.warningBorrowRate,
+    dangerBorrowRate: w.dangerBorrowRate ?? defaults.dangerBorrowRate
+  };
+}
+
+// 0 = ok, 1 = warning, 2 = danger. Worst of the health-factor and borrow-rate checks.
+function positionSeverity(thresholds, healthFactor, borrowRate) {
+  let level = 0;
+
+  const hf = parseFloat(healthFactor);
+  if (Number.isFinite(hf)) {
+    if (hf <= thresholds.dangerHealthFactor) level = Math.max(level, 2);
+    else if (hf <= thresholds.warningHealthFactor) level = Math.max(level, 1);
+  }
+
+  const br = parseFloat(borrowRate);
+  if (Number.isFinite(br)) {
+    if (br >= thresholds.dangerBorrowRate) level = Math.max(level, 2);
+    else if (br >= thresholds.warningBorrowRate) level = Math.max(level, 1);
+  }
+
+  return level;
+}
+
+function formatThresholdValue(field, value) {
+  return field.kind === "rate" ? `${value}%` : `${value}`;
 }
 
 function mainMenu() {
@@ -83,16 +133,26 @@ function mainMenu() {
   ]);
 }
 
-function protocolMenu(protocol, user) {
-  const thresholds = getThresholds(user, protocol);
+function protocolMenu(protocol) {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(`Warning HF: ${thresholds.warning}`, `action:setwarning:${protocol}`),
-      Markup.button.callback(`Danger HF: ${thresholds.danger}`, `action:setdanger:${protocol}`)
-    ],
     [
       Markup.button.callback("Check", `action:check:${protocol}`),
       Markup.button.callback("Refresh Markets", `action:refresh:${protocol}`)
+    ],
+    [Markup.button.callback("Back", "menu:main")]
+  ]);
+}
+
+function settingsMenu(user) {
+  const d = getGlobalDefaults(user);
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`Warning HF: ${d.warningHealthFactor}`, "def:set:whf"),
+      Markup.button.callback(`Danger HF: ${d.dangerHealthFactor}`, "def:set:dhf")
+    ],
+    [
+      Markup.button.callback(`Warning Rate: ${d.warningBorrowRate}%`, "def:set:wbr"),
+      Markup.button.callback(`Danger Rate: ${d.dangerBorrowRate}%`, "def:set:dbr")
     ],
     [Markup.button.callback("Back", "menu:main")]
   ]);
@@ -110,13 +170,52 @@ function walletMenu(user) {
   for (let i = 0; i < wallets.length; i += 1) {
     const wallet = wallets[i];
     rows.push([
-      Markup.button.callback(formatWalletLabel(wallet), `action:wallet:noop:${i}`),
-      Markup.button.callback("✖", `action:wallet:remove:${i}`)
+      Markup.button.callback(formatWalletLabel(wallet), `wallet:open:${i}`),
+      Markup.button.callback("✖", `wallet:remove:${i}`)
     ]);
   }
   rows.push([Markup.button.callback("Add Wallet", "action:addwallet")]);
   rows.push([Markup.button.callback("Back", "menu:main")]);
   return Markup.inlineKeyboard(rows);
+}
+
+function walletSettingsMenu(user, wallet) {
+  const t = getWalletThresholds(user, wallet);
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`Warning HF: ${t.warningHealthFactor}`, "wallet:set:whf"),
+      Markup.button.callback(`Danger HF: ${t.dangerHealthFactor}`, "wallet:set:dhf")
+    ],
+    [
+      Markup.button.callback(`Warning Rate: ${t.warningBorrowRate}%`, "wallet:set:wbr"),
+      Markup.button.callback(`Danger Rate: ${t.dangerBorrowRate}%`, "wallet:set:dbr")
+    ],
+    [Markup.button.callback("Reset to defaults", "wallet:reset")],
+    [Markup.button.callback("Back", "wallet:back")]
+  ]);
+}
+
+function formatWalletSettings(user, wallet) {
+  const t = getWalletThresholds(user, wallet);
+  const overrides = user?.wallets?.[wallet]?.settings || {};
+  const mark = (key) => (overrides[key] != null ? "" : " (default)");
+  return [
+    "Wallet settings",
+    `\`${wallet}\``,
+    "",
+    `Warning HF: ${t.warningHealthFactor}${mark("warningHealthFactor")}`,
+    `Danger HF: ${t.dangerHealthFactor}${mark("dangerHealthFactor")}`,
+    `Warning Rate: ${t.warningBorrowRate}%${mark("warningBorrowRate")}`,
+    `Danger Rate: ${t.dangerBorrowRate}%${mark("dangerBorrowRate")}`
+  ].join("\n");
+}
+
+function resolveWalletArg(user, arg) {
+  const wallets = Object.keys(user?.wallets || {});
+  if (/^\d+$/.test(arg)) {
+    return wallets[Number(arg) - 1] || null;
+  }
+  return wallets.includes(arg) ? arg : null;
 }
 
 function formatResultsByWallet(resultsByWallet) {
@@ -170,11 +269,12 @@ async function addWallet(ctx, wallet) {
     const marketNames = positions.map(p => p.market);
     user.wallets[wallet] = {
       markets: marketNames,
-      protocol
+      protocol,
+      settings: {}
     };
     setUser(chatId, user);
     logger.info({ chatId, wallet, markets: marketNames }, "Wallet added");
-    const lines = positions.map(p => formatPosition({ user, position: p, protocol }));
+    const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
     ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
   } catch (error) {
     await deleteMessage(ctx, statusMsg.message_id);
@@ -228,7 +328,7 @@ async function checkWallets(ctx, user, protocolFilter) {
         positions = await checkSpecificMarkets(wallet, markets);
       }
       if (positions && positions.length > 0) {
-        const lines = positions.map(p => formatPosition({ user, position: p, protocol }));
+        const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
         if (!grouped.has(wallet)) grouped.set(wallet, {});
         grouped.get(wallet)[protocol] = lines;
       } else {
@@ -267,7 +367,7 @@ async function refreshMarketsForUser(ctx, user, protocolFilter) {
       if (positions && positions.length > 0) {
         const marketNames = positions.map(p => p.market);
         walletData.markets = marketNames;
-        const lines = positions.map(p => formatPosition({ user, position: p, protocol }));
+        const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
         if (!grouped.has(wallet)) grouped.set(wallet, {});
         grouped.get(wallet)[protocol] = lines;
       } else {
@@ -292,11 +392,13 @@ bot.start((ctx) => {
     "/menu - open menu\n" +
     "/add <wallet> - add wallet to monitor\n" +
     "/remove <wallet> - remove wallet\n" +
-    "/list - show your wallets\n" +
-    "/check - check LTV for your wallets\n" +
+    "/list - show your wallets and thresholds\n" +
+    "/check - check positions for your wallets\n" +
     "/refreshmarkets - rescan markets for your wallets\n" +
-    `/setwarning <value> - set warning health factor (default: ${WARNING_HEALTH_FACTOR})\n` +
-    `/setdanger <value> - set danger health factor (default: ${DANGER_HEALTH_FACTOR})\n` +
+    "/setwarning <wallet|index|default> <value> - set warning health factor\n" +
+    "/setdanger <wallet|index|default> <value> - set danger health factor\n" +
+    "/setratewarning <wallet|index|default> <value> - set warning borrow rate (%)\n" +
+    "/setratedanger <wallet|index|default> <value> - set danger borrow rate (%)\n" +
     "/settings - show your current settings\n" +
     "/stop - stop monitoring and remove all wallets"
   );
@@ -315,15 +417,11 @@ bot.action("menu:settings", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
-  const kamino = getThresholds(user, "kamino");
-  const aave = getThresholds(user, "aave");
-  const lines = [
-    `Kamino warning: ${kamino.warning}${user.settings.kamino.warningHealthFactor ? "" : " (default)"}`,
-    `Kamino danger: ${kamino.danger}${user.settings.kamino.dangerHealthFactor ? "" : " (default)"}`,
-    `Aave warning: ${aave.warning}${user.settings.aave.warningHealthFactor ? "" : " (default)"}`,
-    `Aave danger: ${aave.danger}${user.settings.aave.dangerHealthFactor ? "" : " (default)"}`
-  ];
-  await ctx.editMessageText(`Your settings:\n\n${lines.join("\n")}`, mainMenu());
+  await ctx.editMessageText(
+    "Global default thresholds.\nApplied to wallets that don't override them.",
+    settingsMenu(user)
+  );
+  setUser(chatId, user);
 });
 
 bot.action("menu:wallets", async (ctx) => {
@@ -341,27 +439,7 @@ bot.action(/menu:protocol:(.+)/, async (ctx) => {
   const user = ensureUser(chatId);
   user.ui.protocol = protocol;
   setUser(chatId, user);
-  await ctx.editMessageText(`${protocol.toUpperCase()} menu`, protocolMenu(protocol, user));
-});
-
-bot.action(/action:setwarning:(.+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const protocol = ctx.match[1];
-  const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
-  user.ui.pending = { action: "setwarning", protocol };
-  setUser(chatId, user);
-  await ctx.reply(`Send warning health factor for ${protocol}`);
-});
-
-bot.action(/action:setdanger:(.+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const protocol = ctx.match[1];
-  const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
-  user.ui.pending = { action: "setdanger", protocol };
-  setUser(chatId, user);
-  await ctx.reply(`Send danger health factor for ${protocol}`);
+  await ctx.editMessageText(`${protocol.toUpperCase()} menu`, protocolMenu(protocol));
 });
 
 bot.action(/action:check:(.+)/, async (ctx) => {
@@ -389,43 +467,84 @@ bot.action("action:addwallet", async (ctx) => {
   await ctx.reply("Send wallet address to add");
 });
 
-bot.action("action:removewallet", async (ctx) => {
+bot.action(/wallet:open:(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
-  user.ui.pending = { action: "removewallet" };
-  setUser(chatId, user);
-  await ctx.reply("Send wallet address to remove");
-});
-
-bot.action("action:listwallets", async (ctx) => {
-  await ctx.answerCbQuery();
-  const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
-  if (!user.wallets || Object.keys(user.wallets).length === 0) {
-    return ctx.reply("No wallets configured");
+  const index = Number(ctx.match[1]);
+  const wallet = user.ui.walletMenu?.[index];
+  if (!wallet || !user.wallets[wallet]) {
+    return ctx.reply("Wallet not found");
   }
-  const wallets = Object.keys(user.wallets);
-  const lines = wallets.map((w, i) => `${i + 1}. \`${w}\``);
-  await ctx.reply(`Your wallets:\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+  user.ui.currentWallet = wallet;
+  setUser(chatId, user);
+  await ctx.editMessageText(formatWalletSettings(user, wallet), {
+    parse_mode: "Markdown",
+    ...walletSettingsMenu(user, wallet)
+  });
 });
 
-bot.action(/action:wallet:noop:(\d+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-});
-
-bot.action(/action:wallet:remove:(.+)/, async (ctx) => {
+bot.action(/wallet:remove:(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  let user = ensureUser(chatId);
   const index = Number(ctx.match[1]);
   const wallet = user.ui.walletMenu?.[index];
   if (!wallet) {
     return ctx.reply("Wallet not found");
   }
   removeWallet(ctx, wallet);
+  user = ensureUser(chatId);
   await ctx.editMessageText("Wallets", walletMenu(user));
   setUser(chatId, user);
+});
+
+bot.action(/wallet:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const chatId = String(ctx.chat.id);
+  const user = ensureUser(chatId);
+  const field = ctx.match[1];
+  const wallet = user.ui.currentWallet;
+  if (!wallet || !user.wallets[wallet]) {
+    return ctx.reply("Wallet not found");
+  }
+  user.ui.pending = { action: "setwallet", field, wallet };
+  setUser(chatId, user);
+  await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} for ${formatWalletLabel(wallet)}`);
+});
+
+bot.action("wallet:reset", async (ctx) => {
+  await ctx.answerCbQuery();
+  const chatId = String(ctx.chat.id);
+  const user = ensureUser(chatId);
+  const wallet = user.ui.currentWallet;
+  if (!wallet || !user.wallets[wallet]) {
+    return ctx.reply("Wallet not found");
+  }
+  user.wallets[wallet].settings = {};
+  setUser(chatId, user);
+  await ctx.editMessageText(formatWalletSettings(user, wallet), {
+    parse_mode: "Markdown",
+    ...walletSettingsMenu(user, wallet)
+  });
+});
+
+bot.action("wallet:back", async (ctx) => {
+  await ctx.answerCbQuery();
+  const chatId = String(ctx.chat.id);
+  const user = ensureUser(chatId);
+  await ctx.editMessageText("Wallets", walletMenu(user));
+  setUser(chatId, user);
+});
+
+bot.action(/def:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const chatId = String(ctx.chat.id);
+  const user = ensureUser(chatId);
+  const field = ctx.match[1];
+  user.ui.pending = { action: "setdefault", field };
+  setUser(chatId, user);
+  await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} (global default)`);
 });
 
 bot.on("text", async (ctx) => {
@@ -448,28 +567,37 @@ bot.on("text", async (ctx) => {
     return removeWallet(ctx, text.trim());
   }
 
-  if (pending.action === "setwarning" || pending.action === "setdanger") {
+  if (pending.action === "setwallet" || pending.action === "setdefault") {
     const value = parseFloat(text);
-    if (isNaN(value) || value <= 0) {
-      return ctx.reply("Send a positive number");
-    }
-    const protocol = pending.protocol;
-    if (!protocol || (protocol !== "aave" && protocol !== "kamino")) {
+    const field = THRESHOLD_FIELDS[pending.field];
+    if (!field) {
       user.ui.pending = null;
       setUser(chatId, user);
-      return ctx.reply("Unknown protocol");
+      return ctx.reply("Unknown setting");
     }
-    if (pending.action === "setwarning") {
-      user.settings[protocol].warningHealthFactor = value;
-      logger.info({ chatId, protocol, warningHealthFactor: value }, "Warning health factor set");
-      await ctx.reply(`Warning health factor for ${protocol} set to ${value}`);
-    } else {
-      user.settings[protocol].dangerHealthFactor = value;
-      logger.info({ chatId, protocol, dangerHealthFactor: value }, "Danger health factor set");
-      await ctx.reply(`Danger health factor for ${protocol} set to ${value}`);
+    if (!Number.isFinite(value) || value <= 0) {
+      return ctx.reply("Send a positive number");
     }
+
     user.ui.pending = null;
+
+    if (pending.action === "setdefault") {
+      user.settings[field.key] = value;
+      setUser(chatId, user);
+      logger.info({ chatId, field: field.key, value }, "Global default set");
+      return ctx.reply(`Default ${field.label} set to ${formatThresholdValue(field, value)}`);
+    }
+
+    const wallet = pending.wallet;
+    if (!wallet || !user.wallets[wallet]) {
+      setUser(chatId, user);
+      return ctx.reply("Wallet not found");
+    }
+    if (!user.wallets[wallet].settings) user.wallets[wallet].settings = {};
+    user.wallets[wallet].settings[field.key] = value;
     setUser(chatId, user);
+    logger.info({ chatId, wallet, field: field.key, value }, "Wallet threshold set");
+    return ctx.reply(`${field.label} for ${formatWalletLabel(wallet)} set to ${formatThresholdValue(field, value)}`);
   }
 });
 
@@ -486,14 +614,17 @@ bot.command("remove", (ctx) => {
 bot.command("list", (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = getUser(chatId);
-  
+
   if (!user || !user.wallets || Object.keys(user.wallets).length === 0) {
     return ctx.reply("No wallets configured");
   }
-  
+
   const wallets = Object.keys(user.wallets);
-  const lines = wallets.map((w, i) => `${i + 1}. \`${w}\``);
-  ctx.reply(`Your wallets:\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+  const lines = wallets.map((w, i) => {
+    const t = getWalletThresholds(user, w);
+    return `${i + 1}. \`${w}\`\n   HF ${t.warningHealthFactor}/${t.dangerHealthFactor}, Rate ${t.warningBorrowRate}%/${t.dangerBorrowRate}%`;
+  });
+  ctx.reply(`Your wallets (warning/danger):\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
 });
 
 bot.command("check", async (ctx) => {
@@ -516,62 +647,64 @@ bot.command("refreshmarkets", async (ctx) => {
   await refreshMarketsForUser(ctx, user, protocol);
 });
 
-bot.command("setwarning", (ctx) => {
-  const parts = ctx.message.text.split(" ");
-  const value = parseFloat(parts[1]);
+function handleSetThreshold(ctx, command, fieldCode) {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const target = parts[1];
+  const value = parseFloat(parts[2]);
+  const field = THRESHOLD_FIELDS[fieldCode];
   const chatId = String(ctx.chat.id);
-  const protocolArg = parts[2]?.toLowerCase();
   const user = ensureUser(chatId);
-  const protocol = protocolArg || user.ui.protocol;
 
-  if (isNaN(value) || value <= 0) {
-    return ctx.reply("Usage: /setwarning <positive_number>\nExample: /setwarning 1.5");
-  }
-  if (!protocol || (protocol !== "aave" && protocol !== "kamino")) {
-    return ctx.reply("Choose protocol in menu or use /setwarning <value> <aave|kamino>");
+  if (!target || !Number.isFinite(value) || value <= 0) {
+    return ctx.reply(
+      `Usage: /${command} <wallet|index|default> <positive_number>\n` +
+      `Example: /${command} 1 ${field.kind === "rate" ? "12" : "1.4"}`
+    );
   }
 
-  user.settings[protocol].warningHealthFactor = value;
+  if (target.toLowerCase() === "default") {
+    user.settings[field.key] = value;
+    setUser(chatId, user);
+    logger.info({ chatId, field: field.key, value }, "Global default set");
+    return ctx.reply(`Default ${field.label} set to ${formatThresholdValue(field, value)}`);
+  }
+
+  const wallet = resolveWalletArg(user, target);
+  if (!wallet) {
+    return ctx.reply("Wallet not found. Use /list to see wallets.");
+  }
+  if (!user.wallets[wallet].settings) user.wallets[wallet].settings = {};
+  user.wallets[wallet].settings[field.key] = value;
   setUser(chatId, user);
+  logger.info({ chatId, wallet, field: field.key, value }, "Wallet threshold set");
+  return ctx.reply(`${field.label} for ${formatWalletLabel(wallet)} set to ${formatThresholdValue(field, value)}`);
+}
 
-  logger.info({ chatId, protocol, warningHealthFactor: value }, "Warning health factor set");
-  ctx.reply(`Warning health factor for ${protocol} set to ${value}`);
-});
-
-bot.command("setdanger", (ctx) => {
-  const parts = ctx.message.text.split(" ");
-  const value = parseFloat(parts[1]);
-  const chatId = String(ctx.chat.id);
-  const protocolArg = parts[2]?.toLowerCase();
-  const user = ensureUser(chatId);
-  const protocol = protocolArg || user.ui.protocol;
-
-  if (isNaN(value) || value <= 0) {
-    return ctx.reply("Usage: /setdanger <positive_number>\nExample: /setdanger 1.3");
-  }
-  if (!protocol || (protocol !== "aave" && protocol !== "kamino")) {
-    return ctx.reply("Choose protocol in menu or use /setdanger <value> <aave|kamino>");
-  }
-
-  user.settings[protocol].dangerHealthFactor = value;
-  setUser(chatId, user);
-
-  logger.info({ chatId, protocol, dangerHealthFactor: value }, "Danger health factor set");
-  ctx.reply(`Danger health factor for ${protocol} set to ${value}`);
-});
+bot.command("setwarning", (ctx) => handleSetThreshold(ctx, "setwarning", "whf"));
+bot.command("setdanger", (ctx) => handleSetThreshold(ctx, "setdanger", "dhf"));
+bot.command("setratewarning", (ctx) => handleSetThreshold(ctx, "setratewarning", "wbr"));
+bot.command("setratedanger", (ctx) => handleSetThreshold(ctx, "setratedanger", "dbr"));
 
 bot.command("settings", (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
-  const kamino = getThresholds(user, "kamino");
-  const aave = getThresholds(user, "aave");
+  const d = getGlobalDefaults(user);
   const lines = [
-    `Kamino warning: ${kamino.warning}${user.settings.kamino.warningHealthFactor ? "" : " (default)"}`,
-    `Kamino danger: ${kamino.danger}${user.settings.kamino.dangerHealthFactor ? "" : " (default)"}`,
-    `Aave warning: ${aave.warning}${user.settings.aave.warningHealthFactor ? "" : " (default)"}`,
-    `Aave danger: ${aave.danger}${user.settings.aave.dangerHealthFactor ? "" : " (default)"}`
+    "Global defaults (warning/danger):",
+    `HF: ${d.warningHealthFactor}/${d.dangerHealthFactor}`,
+    `Borrow Rate: ${d.warningBorrowRate}%/${d.dangerBorrowRate}%`
   ];
-  ctx.reply(`Your settings:\n\n${lines.join("\n")}`);
+  const wallets = Object.keys(user.wallets || {});
+  if (wallets.length > 0) {
+    lines.push("", "Wallets:");
+    wallets.forEach((w, i) => {
+      const t = getWalletThresholds(user, w);
+      lines.push(
+        `${i + 1}. ${formatWalletLabel(w)} — HF ${t.warningHealthFactor}/${t.dangerHealthFactor}, Rate ${t.warningBorrowRate}%/${t.dangerBorrowRate}%`
+      );
+    });
+  }
+  ctx.reply(lines.join("\n"));
 });
 
 bot.command("stop", (ctx) => {
@@ -592,19 +725,17 @@ async function refreshMarketsBackground() {
 
 async function checkAllUsers() {
   for (const [chatId, user] of getAllUsers()) {
-    logger.info({ chatId, user }, "Checking user ltv on background");
+    logger.info({ chatId }, "Checking user positions on background");
 
     if (!user.wallets) continue;
-    
+
     for (const [wallet, walletData] of Object.entries(user.wallets)) {
       const protocol = walletData.protocol || "kamino";
       const markets = walletData.markets || [];
-      const thresholds = getThresholds(user, protocol);
-      
-      logger.info({ chatId, wallet, markets, protocol }, "Markets");
+      const thresholds = getWalletThresholds(user, wallet);
 
       if (protocol === "kamino" && markets.length === 0) continue;
-      
+
       try {
         let positions;
         if (protocol === "aave") {
@@ -612,36 +743,24 @@ async function checkAllUsers() {
         } else {
           positions = await checkSpecificMarkets(wallet, markets);
         }
-        
-        logger.info({ chatId, wallet, positions }, "Positions");
 
         if (!positions || positions.length === 0) continue;
 
-        for (const pos of positions) {
-          const healthFactor = parseFloat(pos.healthFactor);
+        const breaching = positions.filter(
+          (p) => positionSeverity(thresholds, p.healthFactor, p.borrowRate) >= 1
+        );
+        if (breaching.length === 0) continue;
 
-          if (!Number.isFinite(healthFactor)) continue;
-          if (healthFactor > thresholds.warning) continue;
+        logger.info(
+          { chatId, wallet, protocol, breaching: breaching.map((p) => p.market), thresholds },
+          "Threshold breached"
+        );
 
-          logger.info(
-            {
-              chatId,
-              wallet,
-              market: pos.market,
-              healthFactor,
-              dangerHf: thresholds.danger,
-              warningHf: thresholds.warning,
-              protocol
-            },
-            "Health factor"
-          );
-          
-          const grouped = new Map();
-          grouped.set(wallet, { [protocol]: positions.map(p => formatPosition({ user, position: p, protocol })) });
-          bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
-        }
-        
-        setUser(chatId, user);
+        const grouped = new Map();
+        grouped.set(wallet, {
+          [protocol]: positions.map((p) => formatPosition({ user, wallet, position: p }))
+        });
+        await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
       } catch (error) {
         logger.error({ chatId, wallet, error: error.message }, "Check failed");
       }
@@ -656,33 +775,35 @@ async function init() {
   } catch (error) {
     logger.error({ error: error.message }, "Failed to load markets on startup");
   }
-  
+
   setInterval(refreshMarketsBackground, CHECK_INTERVAL);
   setInterval(checkAllUsers, CHECK_INTERVAL);
-  
+
   try {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
       { command: "add", description: "Add wallet" },
       { command: "remove", description: "Remove wallet" },
-      { command: "list", description: "List wallets" },
-      { command: "check", description: "Check LTV (all/aave/kamino)" },
+      { command: "list", description: "List wallets and thresholds" },
+      { command: "check", description: "Check positions (all/aave/kamino)" },
       { command: "refreshmarkets", description: "Refresh markets (all/aave/kamino)" },
-      { command: "setwarning", description: "Set warning HF (aave/kamino)" },
-      { command: "setdanger", description: "Set danger HF (aave/kamino)" },
+      { command: "setwarning", description: "Warning HF <wallet|index|default> <value>" },
+      { command: "setdanger", description: "Danger HF <wallet|index|default> <value>" },
+      { command: "setratewarning", description: "Warning rate <wallet|index|default> <value>" },
+      { command: "setratedanger", description: "Danger rate <wallet|index|default> <value>" },
       { command: "settings", description: "Show settings" },
       { command: "stop", description: "Stop monitoring" }
     ]);
   } catch (error) {
     logger.error({ error: error.message }, "Failed to set bot commands");
   }
-  
+
   const userCount = getUserCount();
   if (userCount > 0) {
     logger.info({ count: userCount }, "Users loaded");
     setTimeout(checkAllUsers, 5000);
   }
-  
+
   bot.launch();
   logger.info("Bot started");
 }
@@ -699,15 +820,24 @@ process.once("SIGTERM", () => {
   bot.stop("SIGTERM");
 });
 
-function formatPosition({ user, position, protocol }) {
-  const thresholds = getThresholds(user, protocol || "kamino");
+function formatBorrowRates(position) {
+  const borrows = Array.isArray(position.borrows)
+    ? position.borrows.filter((b) => b && Number.isFinite(parseFloat(b.rate)))
+    : [];
 
-  let prefix = "✅ ";
-  if (position.healthFactor <= thresholds.danger) {
-    prefix = "☠️ ";
-  } else if (position.healthFactor <= thresholds.warning) {
-    prefix = "⚠️ ";
+  if (borrows.length === 0) {
+    return position.borrowRate == null ? "Borrow Rate: n/a" : `Borrow Rate: ${position.borrowRate}%`;
   }
 
-  return `${prefix}${position.market}:\nLTV: ${position.ltv}%\nLiquidation LTV: ${position.liquidationLtv}%\nHealth Factor: ${position.healthFactor}`;
+  const lines = borrows.map((b) => `  ${b.token}: ${b.rate}%`);
+  return `Borrow Rate:\n${lines.join("\n")}`;
+}
+
+function formatPosition({ user, wallet, position }) {
+  const thresholds = getWalletThresholds(user, wallet);
+  const level = positionSeverity(thresholds, position.healthFactor, position.borrowRate);
+
+  const prefix = level === 2 ? "☠️ " : level === 1 ? "⚠️ " : "✅ ";
+
+  return `${prefix}${position.market}:\nLTV: ${position.ltv}%\nLiquidation LTV: ${position.liquidationLtv}%\nHealth Factor: ${position.healthFactor}\n${formatBorrowRates(position)}`;
 }
