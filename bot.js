@@ -702,53 +702,67 @@ async function checkPoolsForWallet(chatId, wallet, walletData) {
   const previous = walletData.poolStates || {};
   const next = {};
   const transitions = [];
+  const seeded = [];
 
   for (const pool of pools) {
     next[pool.id] = pool.inRange;
-    if (pool.id in previous && previous[pool.id] !== pool.inRange) {
+    if (!(pool.id in previous)) {
+      seeded.push(`${pool.pool} = ${pool.inRange ? "in" : "out"}`);
+    } else if (previous[pool.id] !== pool.inRange) {
       transitions.push(pool);
     }
   }
-  walletData.poolStates = next;
 
-  if (transitions.length === 0) return;
-
-  logger.info(
-    { chatId, wallet, transitions: transitions.map((p) => `${p.pool} -> ${p.inRange ? "in" : "out"}`) },
-    "Pool range transition"
-  );
-
-  const grouped = new Map();
-  for (const pool of transitions) {
-    if (!grouped.has(wallet)) grouped.set(wallet, {});
-    const protocols = grouped.get(wallet);
-    if (!protocols[pool.platform]) protocols[pool.platform] = [];
-    protocols[pool.platform].push(formatPoolPosition(pool, true));
+  if (seeded.length > 0) {
+    logger.info({ chatId, wallet, seeded }, "Pool baseline recorded");
   }
-  await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+
+  if (transitions.length > 0) {
+    logger.info(
+      { chatId, wallet, transitions: transitions.map((p) => `${p.pool} -> ${p.inRange ? "in" : "out"}`) },
+      "Pool range transition"
+    );
+
+    const grouped = new Map();
+    for (const pool of transitions) {
+      if (!grouped.has(wallet)) grouped.set(wallet, {});
+      const protocols = grouped.get(wallet);
+      if (!protocols[pool.platform]) protocols[pool.platform] = [];
+      protocols[pool.platform].push(formatPoolPosition(pool, true));
+    }
+    // Send BEFORE persisting the new state: if sending fails, the old state
+    // is kept and the transition fires again on the next cycle.
+    await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+  }
+
+  walletData.poolStates = next;
 }
 
 async function checkAllUsers() {
-  for (const [chatId, user] of getAllUsers()) {
-    logger.info({ chatId }, "Checking user positions on background");
+  try {
+    for (const [chatId, user] of getAllUsers()) {
+      logger.info({ chatId }, "Checking user positions on background");
 
-    if (!user.wallets) continue;
+      if (!user.wallets) continue;
 
-    for (const [wallet, walletData] of Object.entries(user.wallets)) {
-      try {
-        await checkLendingForWallet(chatId, user, wallet, walletData);
-      } catch (error) {
-        logger.error({ chatId, wallet, error: error.message }, "Check failed");
+      for (const [wallet, walletData] of Object.entries(user.wallets)) {
+        try {
+          await checkLendingForWallet(chatId, user, wallet, walletData);
+        } catch (error) {
+          logger.error({ chatId, wallet, error: error.message }, "Check failed");
+        }
+        try {
+          await checkPoolsForWallet(chatId, wallet, walletData);
+        } catch (error) {
+          // Keep previous poolStates on scan failure to avoid phantom transitions.
+          logger.error({ chatId, wallet, error: error.message }, "Pool check failed");
+        }
       }
-      try {
-        await checkPoolsForWallet(chatId, wallet, walletData);
-      } catch (error) {
-        // Keep previous poolStates on scan failure to avoid phantom transitions.
-        logger.error({ chatId, wallet, error: error.message }, "Pool check failed");
-      }
+
+      setUser(chatId, user);
     }
-
-    setUser(chatId, user);
+  } catch (error) {
+    logger.error({ error: error.message }, "Background check cycle failed");
   }
 }
 

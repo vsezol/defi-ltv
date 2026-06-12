@@ -9,21 +9,27 @@ const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const MINTS_PER_REQUEST = 40;
 
+const RPC_RETRY_ROUNDS = 2;
+
 async function solanaRpc(method, params) {
   let lastError;
-  for (const url of SOLANA_RPCS) {
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: AbortSignal.timeout(30000)
-      });
-      const data = await response.json();
-      if (data.error) throw new Error(`${method}: ${JSON.stringify(data.error)}`);
-      return data.result;
-    } catch (error) {
-      lastError = error;
+  for (let round = 0; round < RPC_RETRY_ROUNDS; round += 1) {
+    if (round > 0) await new Promise((resolve) => setTimeout(resolve, 2000));
+    for (const url of SOLANA_RPCS) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+          signal: AbortSignal.timeout(30000)
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(`${method}: ${JSON.stringify(data.error)}`);
+        return data.result;
+      } catch (error) {
+        lastError = error;
+        logger.warn({ url, method, error: error.message }, "Solana RPC attempt failed");
+      }
     }
   }
   throw lastError;
