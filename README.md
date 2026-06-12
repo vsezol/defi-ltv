@@ -1,21 +1,31 @@
 # defi-ltv
 
-Telegram bot that monitors the **Health Factor (HF)**, **LTV** and **borrow rate**
-of your DeFi lending positions on **Kamino** (Solana) and **Aave V3** (Ethereum,
-Arbitrum, Base), and alerts you when a position crosses your Warning/Danger
-threshold.
+Telegram bot that monitors your DeFi positions:
+
+- **Lending** — Health Factor (HF), LTV and borrow rate on **Kamino** (Solana)
+  and **Aave V3** (Ethereum, Arbitrum, Base), alerting when a position crosses
+  your Warning/Danger threshold.
+- **LP pools** — concentrated-liquidity positions on **Orca** (Solana) and
+  **Uniswap V3** (Ethereum, Arbitrum, Base), alerting when a position goes
+  **out of range** or comes back **in range**.
 
 ## How it works
 
-- Add a wallet — the protocol is auto-detected from the address format
-  (`0x…` → Aave, Solana base58 → Kamino).
-- Every 10 minutes it re-checks all positions and pings you on Telegram when
-  `HF ≤ Warning` **or** `borrow rate ≥ Warning`.
-- Thresholds are **per-wallet**: every wallet has its own Warning/Danger for HF
-  and for borrow rate. New wallets inherit user-wide **global defaults** (which you
-  can change) — Warning HF `1.5`, Danger HF `1.3`, Warning rate `10%`, Danger rate `15%`.
+- Add a wallet — platforms are auto-detected from the address format
+  (`0x…` → Aave + Uniswap V3, Solana base58 → Kamino + Orca).
+- Every 10 minutes it re-checks all positions and pings you on Telegram when:
+  - `HF ≤ Warning` **or** `borrow rate ≥ Warning` (lending), or
+  - an LP position **crosses the range boundary** (in ↔ out). Range alerts fire
+    only on the transition, not repeatedly while it stays out of range.
+- Lending thresholds are **per-wallet**: every wallet has its own Warning/Danger
+  for HF and for borrow rate. New wallets inherit user-wide **global defaults**
+  (which you can change) — Warning HF `1.5`, Danger HF `1.3`, Warning rate `10%`,
+  Danger rate `15%`.
 - Borrow rate is the borrow APY. For a Kamino position that borrows several
   assets, the **highest** asset borrow APY is used; for Aave it's the per-asset rate.
+- LP positions are discovered live on every check: Orca via the wallet's position
+  NFTs + Orca public API, Uniswap V3 via the NonfungiblePositionManager contract
+  on each chain.
 
 It's a single Node.js process — no Docker, no database. State lives in local JSON
 files (`db-kamino.json`, `db-aave.json`), created on first run.
@@ -27,6 +37,8 @@ files (`db-kamino.json`, `db-aave.json`), created on first run.
 | `bot.js` | Entry point: Telegram bot, commands, menu, background check loop. |
 | `kamino.js` | Kamino markets & positions via `https://api.kamino.finance`. |
 | `aave.js` | Aave V3 positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), with multi-RPC fallback. |
+| `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
+| `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
 | `db.js` | File-based storage for users, wallets, settings and market cache. |
 | `logger.js` | Logging (pino; pretty output in dev). |
 
@@ -53,19 +65,9 @@ npm run dev            # loads .env automatically (--env-file=.env)
 
 ## Bot commands
 
-All threshold commands take a target — a wallet address, its **index** from
-`/list`, or the keyword **`default`** (to change the global defaults).
+Everything is driven through the interactive menu:
 
-- `/menu` — open the interactive menu. Tap a wallet under **Wallets** to edit its
-  thresholds; **Settings** edits the global defaults.
-- `/add <wallet>` — add a wallet (protocol auto-detected).
-- `/remove <wallet>` — remove a wallet.
-- `/list` — list your wallets with their thresholds.
-- `/check [all|aave|kamino]` — check positions now.
-- `/refreshmarkets [all|aave|kamino]` — rescan markets for your wallets.
-- `/setwarning <wallet|index|default> <value>` — set Warning HF.
-- `/setdanger <wallet|index|default> <value>` — set Danger HF.
-- `/setratewarning <wallet|index|default> <value>` — set Warning borrow rate (%).
-- `/setratedanger <wallet|index|default> <value>` — set Danger borrow rate (%).
-- `/settings` — show global defaults and per-wallet thresholds.
-- `/stop` — stop monitoring and remove all wallets.
+- `/menu` — open the menu: add/remove wallets, tap a wallet under **Wallets** to
+  edit its thresholds, **Settings** edits the global defaults, **Check All** /
+  **Refresh All** run checks.
+- `/checkall` — check all positions now (lending + LP pools).

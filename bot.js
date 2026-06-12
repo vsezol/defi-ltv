@@ -1,6 +1,8 @@
 import { Telegraf, Markup } from "telegraf";
 import { fetchMarkets, scanAllMarketsForWallet, checkSpecificMarkets } from "./kamino.js";
 import { fetchAaveMarketsAll, scanAaveMarketsForWallet, checkAaveMarkets } from "./aave.js";
+import { getOrcaPositionsForWallet } from "./orca.js";
+import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { loadDb, getUser, setUser, deleteUser, getUserCount, getAllUsers } from "./db.js";
 import { logger } from "./logger.js";
 
@@ -118,6 +120,32 @@ function formatThresholdValue(field, value) {
   return field.kind === "rate" ? `${value}%` : `${value}`;
 }
 
+// LP positions (Orca for Solana wallets, Uniswap V3 for EVM wallets).
+async function scanPoolsForWallet(wallet) {
+  const walletType = detectWalletType(wallet);
+  if (walletType === "solana") return getOrcaPositionsForWallet(wallet);
+  if (walletType === "evm") return getUniswapPositionsForWallet(wallet);
+  return [];
+}
+
+function formatPoolPrice(value) {
+  if (!Number.isFinite(value)) return "?";
+  if (value >= 1) return value.toFixed(2);
+  return value.toPrecision(4);
+}
+
+function formatPoolPosition(position, transition) {
+  const prefix = position.inRange ? "✅ " : "🔴 ";
+  let status = position.inRange ? "IN RANGE" : "OUT OF RANGE";
+  if (transition) {
+    status += position.inRange ? " (was out of range)" : " (was in range)";
+  }
+  const range = position.isFullRange
+    ? "Full range"
+    : `Range: ${formatPoolPrice(position.lowerPrice)} — ${formatPoolPrice(position.upperPrice)} ${position.priceLabel}`;
+  return `${prefix}${position.pool}:\nStatus: ${status}\n${range}\nCurrent: ${formatPoolPrice(position.currentPrice)} ${position.priceLabel}`;
+}
+
 function mainMenu() {
   return Markup.inlineKeyboard([
     [
@@ -210,17 +238,16 @@ function formatWalletSettings(user, wallet) {
   ].join("\n");
 }
 
-function resolveWalletArg(user, arg) {
-  const wallets = Object.keys(user?.wallets || {});
-  if (/^\d+$/.test(arg)) {
-    return wallets[Number(arg) - 1] || null;
-  }
-  return wallets.includes(arg) ? arg : null;
-}
+const PLATFORM_LABELS = {
+  kamino: "*KAMINO*",
+  aave: "*AAVE*",
+  orca: "*ORCA*",
+  uniswap: "*UNISWAP*"
+};
 
 function formatResultsByWallet(resultsByWallet) {
   const output = [];
-  const protocolsOrder = ["kamino", "aave"];
+  const protocolsOrder = ["kamino", "aave", "orca", "uniswap"];
   for (const [wallet, protocols] of resultsByWallet.entries()) {
     output.push(`\`${wallet}\``);
     const protocolKeys = Object.keys(protocols);
@@ -233,7 +260,7 @@ function formatResultsByWallet(resultsByWallet) {
       return aIdx - bIdx;
     });
     for (const protocol of protocolKeys) {
-      const label = protocol === "aave" ? "*AAVE*" : "*KAMINO*";
+      const label = PLATFORM_LABELS[protocol] || `*${protocol.toUpperCase()}*`;
       output.push(label);
       output.push(protocols[protocol].join("\n"));
     }
@@ -261,20 +288,30 @@ async function addWallet(ctx, wallet) {
         editMessage(ctx, statusMsg.message_id, `Scanning market ${marketCheck.current + 1} of ${marketCheck.total}...`);
       });
     }
+    let pools = [];
+    try {
+      pools = await scanPoolsForWallet(wallet);
+    } catch (error) {
+      logger.error({ wallet, error: error.message }, "Pool scan failed on add");
+    }
     await deleteMessage(ctx, statusMsg.message_id);
-    if (!positions || positions.length === 0) {
+    if ((!positions || positions.length === 0) && pools.length === 0) {
       return ctx.reply("No positions found for this wallet");
     }
     const user = ensureUser(chatId);
-    const marketNames = positions.map(p => p.market);
+    const marketNames = (positions || []).map(p => p.market);
+    const poolStates = {};
+    for (const pool of pools) poolStates[pool.id] = pool.inRange;
     user.wallets[wallet] = {
       markets: marketNames,
       protocol,
-      settings: {}
+      settings: {},
+      poolStates
     };
     setUser(chatId, user);
-    logger.info({ chatId, wallet, markets: marketNames }, "Wallet added");
-    const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
+    logger.info({ chatId, wallet, markets: marketNames, pools: pools.length }, "Wallet added");
+    const lines = (positions || []).map(p => formatPosition({ user, wallet, position: p }));
+    lines.push(...pools.map(p => formatPoolPosition(p)));
     ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
   } catch (error) {
     await deleteMessage(ctx, statusMsg.message_id);
@@ -303,6 +340,7 @@ function removeWallet(ctx, wallet) {
 }
 
 async function checkWallets(ctx, user, protocolFilter) {
+  const includePools = !protocolFilter || protocolFilter === "all";
   const wallets = Object.entries(user.wallets || {}).filter(([_, data]) => {
     if (!protocolFilter || protocolFilter === "all") return true;
     return (data.protocol || "kamino") === protocolFilter;
@@ -313,32 +351,41 @@ async function checkWallets(ctx, user, protocolFilter) {
   const statusMsg = await ctx.reply("Checking...");
   const grouped = new Map();
   for (const [wallet, walletData] of wallets) {
+    if (!grouped.has(wallet)) grouped.set(wallet, {});
+    const protocol = walletData.protocol || "kamino";
+    const markets = walletData.markets || [];
     try {
-      const protocol = walletData.protocol || "kamino";
-      const markets = walletData.markets || [];
       if (protocol === "kamino" && markets.length === 0) {
-        if (!grouped.has(wallet)) grouped.set(wallet, {});
-        grouped.get(wallet)[protocol] = ["No markets cached. Use /refreshmarkets"];
-        continue;
-      }
-      let positions;
-      if (protocol === "aave") {
-        positions = await checkAaveMarkets(wallet);
+        grouped.get(wallet)[protocol] = ["No markets cached. Use Refresh All"];
       } else {
-        positions = await checkSpecificMarkets(wallet, markets);
-      }
-      if (positions && positions.length > 0) {
-        const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
-        if (!grouped.has(wallet)) grouped.set(wallet, {});
-        grouped.get(wallet)[protocol] = lines;
-      } else {
-        if (!grouped.has(wallet)) grouped.set(wallet, {});
-        grouped.get(wallet)[protocol] = ["No positions"];
+        let positions;
+        if (protocol === "aave") {
+          positions = await checkAaveMarkets(wallet);
+        } else {
+          positions = await checkSpecificMarkets(wallet, markets);
+        }
+        if (positions && positions.length > 0) {
+          grouped.get(wallet)[protocol] = positions.map(p => formatPosition({ user, wallet, position: p }));
+        } else {
+          grouped.get(wallet)[protocol] = ["No positions"];
+        }
       }
     } catch (error) {
       logger.error({ wallet, error: error.message }, "Check failed");
-      if (!grouped.has(wallet)) grouped.set(wallet, {});
-      grouped.get(wallet)[walletData.protocol || "kamino"] = [`Error: ${error.message}`];
+      grouped.get(wallet)[protocol] = [`Error: ${error.message}`];
+    }
+    if (includePools) {
+      try {
+        const pools = await scanPoolsForWallet(wallet);
+        if (pools.length > 0) {
+          const platform = pools[0].platform;
+          grouped.get(wallet)[platform] = pools.map(p => formatPoolPosition(p));
+        }
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Pool check failed");
+        const platform = detectWalletType(wallet) === "solana" ? "orca" : "uniswap";
+        grouped.get(wallet)[platform] = [`Error: ${error.message}`];
+      }
     }
   }
   await deleteMessage(ctx, statusMsg.message_id);
@@ -389,23 +436,21 @@ async function refreshMarketsForUser(ctx, user, protocolFilter) {
 bot.start((ctx) => {
   ctx.reply(
     "LTV Watch Bot\n\n" +
-    "/menu - open menu\n" +
-    "/add <wallet> - add wallet to monitor\n" +
-    "/remove <wallet> - remove wallet\n" +
-    "/list - show your wallets and thresholds\n" +
-    "/check - check positions for your wallets\n" +
-    "/refreshmarkets - rescan markets for your wallets\n" +
-    "/setwarning <wallet|index|default> <value> - set warning health factor\n" +
-    "/setdanger <wallet|index|default> <value> - set danger health factor\n" +
-    "/setratewarning <wallet|index|default> <value> - set warning borrow rate (%)\n" +
-    "/setratedanger <wallet|index|default> <value> - set danger borrow rate (%)\n" +
-    "/settings - show your current settings\n" +
-    "/stop - stop monitoring and remove all wallets"
+    "Monitors Health Factor / LTV / borrow rate (Kamino, Aave) and\n" +
+    "LP position ranges (Orca, Uniswap V3) for your wallets.\n\n" +
+    "/menu - open menu (wallets, thresholds, checks)\n" +
+    "/checkall - check all positions (lending + pools)"
   );
 });
 
 bot.command("menu", (ctx) => {
   ctx.reply("Menu", mainMenu());
+});
+
+bot.command("checkall", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const user = ensureUser(chatId);
+  await checkWallets(ctx, user, "all");
 });
 
 bot.action("menu:main", async (ctx) => {
@@ -547,9 +592,9 @@ bot.action(/def:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
   await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} (global default)`);
 });
 
-bot.on("text", async (ctx) => {
+bot.on("text", async (ctx, next) => {
   const text = ctx.message.text;
-  if (text.startsWith("/")) return;
+  if (text.startsWith("/")) return next();
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
   const pending = user.ui?.pending;
@@ -559,12 +604,6 @@ bot.on("text", async (ctx) => {
     user.ui.pending = null;
     setUser(chatId, user);
     return addWallet(ctx, text.trim());
-  }
-
-  if (pending.action === "removewallet") {
-    user.ui.pending = null;
-    setUser(chatId, user);
-    return removeWallet(ctx, text.trim());
   }
 
   if (pending.action === "setwallet" || pending.action === "setdefault") {
@@ -601,119 +640,6 @@ bot.on("text", async (ctx) => {
   }
 });
 
-bot.command("add", async (ctx) => {
-  const wallet = ctx.message.text.split(" ")[1];
-  await addWallet(ctx, wallet);
-});
-
-bot.command("remove", (ctx) => {
-  const wallet = ctx.message.text.split(" ")[1];
-  removeWallet(ctx, wallet);
-});
-
-bot.command("list", (ctx) => {
-  const chatId = String(ctx.chat.id);
-  const user = getUser(chatId);
-
-  if (!user || !user.wallets || Object.keys(user.wallets).length === 0) {
-    return ctx.reply("No wallets configured");
-  }
-
-  const wallets = Object.keys(user.wallets);
-  const lines = wallets.map((w, i) => {
-    const t = getWalletThresholds(user, w);
-    return `${i + 1}. \`${w}\`\n   HF ${t.warningHealthFactor}/${t.dangerHealthFactor}, Rate ${t.warningBorrowRate}%/${t.dangerBorrowRate}%`;
-  });
-  ctx.reply(`Your wallets (warning/danger):\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
-});
-
-bot.command("check", async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  const user = getUser(chatId);
-  if (!user || !user.wallets || Object.keys(user.wallets).length === 0) {
-    return ctx.reply("No wallets configured. Use /add <wallet>");
-  }
-  const protocol = ctx.message.text.split(" ")[1];
-  await checkWallets(ctx, user, protocol);
-});
-
-bot.command("refreshmarkets", async (ctx) => {
-  const chatId = String(ctx.chat.id);
-  const user = getUser(chatId);
-  if (!user || !user.wallets || Object.keys(user.wallets).length === 0) {
-    return ctx.reply("No wallets configured. Use /add <wallet>");
-  }
-  const protocol = ctx.message.text.split(" ")[1];
-  await refreshMarketsForUser(ctx, user, protocol);
-});
-
-function handleSetThreshold(ctx, command, fieldCode) {
-  const parts = ctx.message.text.trim().split(/\s+/);
-  const target = parts[1];
-  const value = parseFloat(parts[2]);
-  const field = THRESHOLD_FIELDS[fieldCode];
-  const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
-
-  if (!target || !Number.isFinite(value) || value <= 0) {
-    return ctx.reply(
-      `Usage: /${command} <wallet|index|default> <positive_number>\n` +
-      `Example: /${command} 1 ${field.kind === "rate" ? "12" : "1.4"}`
-    );
-  }
-
-  if (target.toLowerCase() === "default") {
-    user.settings[field.key] = value;
-    setUser(chatId, user);
-    logger.info({ chatId, field: field.key, value }, "Global default set");
-    return ctx.reply(`Default ${field.label} set to ${formatThresholdValue(field, value)}`);
-  }
-
-  const wallet = resolveWalletArg(user, target);
-  if (!wallet) {
-    return ctx.reply("Wallet not found. Use /list to see wallets.");
-  }
-  if (!user.wallets[wallet].settings) user.wallets[wallet].settings = {};
-  user.wallets[wallet].settings[field.key] = value;
-  setUser(chatId, user);
-  logger.info({ chatId, wallet, field: field.key, value }, "Wallet threshold set");
-  return ctx.reply(`${field.label} for ${formatWalletLabel(wallet)} set to ${formatThresholdValue(field, value)}`);
-}
-
-bot.command("setwarning", (ctx) => handleSetThreshold(ctx, "setwarning", "whf"));
-bot.command("setdanger", (ctx) => handleSetThreshold(ctx, "setdanger", "dhf"));
-bot.command("setratewarning", (ctx) => handleSetThreshold(ctx, "setratewarning", "wbr"));
-bot.command("setratedanger", (ctx) => handleSetThreshold(ctx, "setratedanger", "dbr"));
-
-bot.command("settings", (ctx) => {
-  const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
-  const d = getGlobalDefaults(user);
-  const lines = [
-    "Global defaults (warning/danger):",
-    `HF: ${d.warningHealthFactor}/${d.dangerHealthFactor}`,
-    `Borrow Rate: ${d.warningBorrowRate}%/${d.dangerBorrowRate}%`
-  ];
-  const wallets = Object.keys(user.wallets || {});
-  if (wallets.length > 0) {
-    lines.push("", "Wallets:");
-    wallets.forEach((w, i) => {
-      const t = getWalletThresholds(user, w);
-      lines.push(
-        `${i + 1}. ${formatWalletLabel(w)} — HF ${t.warningHealthFactor}/${t.dangerHealthFactor}, Rate ${t.warningBorrowRate}%/${t.dangerBorrowRate}%`
-      );
-    });
-  }
-  ctx.reply(lines.join("\n"));
-});
-
-bot.command("stop", (ctx) => {
-  const chatId = String(ctx.chat.id);
-  deleteUser(chatId);
-  logger.info({ chatId }, "User stopped monitoring");
-  ctx.reply("Monitoring stopped, all wallets removed");
-});
-
 async function refreshMarketsBackground() {
   try {
     await fetchMarkets();
@@ -723,6 +649,72 @@ async function refreshMarketsBackground() {
   }
 }
 
+async function checkLendingForWallet(chatId, user, wallet, walletData) {
+  const protocol = walletData.protocol || "kamino";
+  const markets = walletData.markets || [];
+  const thresholds = getWalletThresholds(user, wallet);
+
+  if (protocol === "kamino" && markets.length === 0) return;
+
+  let positions;
+  if (protocol === "aave") {
+    positions = await checkAaveMarkets(wallet);
+  } else {
+    positions = await checkSpecificMarkets(wallet, markets);
+  }
+
+  if (!positions || positions.length === 0) return;
+
+  const breaching = positions.filter(
+    (p) => positionSeverity(thresholds, p.healthFactor, p.borrowRate) >= 1
+  );
+  if (breaching.length === 0) return;
+
+  logger.info(
+    { chatId, wallet, protocol, breaching: breaching.map((p) => p.market), thresholds },
+    "Threshold breached"
+  );
+
+  const grouped = new Map();
+  grouped.set(wallet, {
+    [protocol]: positions.map((p) => formatPosition({ user, wallet, position: p }))
+  });
+  await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+}
+
+// Notify only when a pool position crosses the range boundary (in <-> out).
+// First sighting of a position just records the baseline state silently.
+async function checkPoolsForWallet(chatId, wallet, walletData) {
+  const pools = await scanPoolsForWallet(wallet);
+  const previous = walletData.poolStates || {};
+  const next = {};
+  const transitions = [];
+
+  for (const pool of pools) {
+    next[pool.id] = pool.inRange;
+    if (pool.id in previous && previous[pool.id] !== pool.inRange) {
+      transitions.push(pool);
+    }
+  }
+  walletData.poolStates = next;
+
+  if (transitions.length === 0) return;
+
+  logger.info(
+    { chatId, wallet, transitions: transitions.map((p) => `${p.pool} -> ${p.inRange ? "in" : "out"}`) },
+    "Pool range transition"
+  );
+
+  const grouped = new Map();
+  for (const pool of transitions) {
+    if (!grouped.has(wallet)) grouped.set(wallet, {});
+    const protocols = grouped.get(wallet);
+    if (!protocols[pool.platform]) protocols[pool.platform] = [];
+    protocols[pool.platform].push(formatPoolPosition(pool, true));
+  }
+  await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+}
+
 async function checkAllUsers() {
   for (const [chatId, user] of getAllUsers()) {
     logger.info({ chatId }, "Checking user positions on background");
@@ -730,41 +722,20 @@ async function checkAllUsers() {
     if (!user.wallets) continue;
 
     for (const [wallet, walletData] of Object.entries(user.wallets)) {
-      const protocol = walletData.protocol || "kamino";
-      const markets = walletData.markets || [];
-      const thresholds = getWalletThresholds(user, wallet);
-
-      if (protocol === "kamino" && markets.length === 0) continue;
-
       try {
-        let positions;
-        if (protocol === "aave") {
-          positions = await checkAaveMarkets(wallet);
-        } else {
-          positions = await checkSpecificMarkets(wallet, markets);
-        }
-
-        if (!positions || positions.length === 0) continue;
-
-        const breaching = positions.filter(
-          (p) => positionSeverity(thresholds, p.healthFactor, p.borrowRate) >= 1
-        );
-        if (breaching.length === 0) continue;
-
-        logger.info(
-          { chatId, wallet, protocol, breaching: breaching.map((p) => p.market), thresholds },
-          "Threshold breached"
-        );
-
-        const grouped = new Map();
-        grouped.set(wallet, {
-          [protocol]: positions.map((p) => formatPosition({ user, wallet, position: p }))
-        });
-        await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+        await checkLendingForWallet(chatId, user, wallet, walletData);
       } catch (error) {
         logger.error({ chatId, wallet, error: error.message }, "Check failed");
       }
+      try {
+        await checkPoolsForWallet(chatId, wallet, walletData);
+      } catch (error) {
+        // Keep previous poolStates on scan failure to avoid phantom transitions.
+        logger.error({ chatId, wallet, error: error.message }, "Pool check failed");
+      }
     }
+
+    setUser(chatId, user);
   }
 }
 
@@ -782,17 +753,7 @@ async function init() {
   try {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
-      { command: "add", description: "Add wallet" },
-      { command: "remove", description: "Remove wallet" },
-      { command: "list", description: "List wallets and thresholds" },
-      { command: "check", description: "Check positions (all/aave/kamino)" },
-      { command: "refreshmarkets", description: "Refresh markets (all/aave/kamino)" },
-      { command: "setwarning", description: "Warning HF <wallet|index|default> <value>" },
-      { command: "setdanger", description: "Danger HF <wallet|index|default> <value>" },
-      { command: "setratewarning", description: "Warning rate <wallet|index|default> <value>" },
-      { command: "setratedanger", description: "Danger rate <wallet|index|default> <value>" },
-      { command: "settings", description: "Show settings" },
-      { command: "stop", description: "Stop monitoring" }
+      { command: "checkall", description: "Check all positions (lending + pools)" }
     ]);
   } catch (error) {
     logger.error({ error: error.message }, "Failed to set bot commands");

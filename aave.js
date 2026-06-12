@@ -7,7 +7,7 @@ const { UiPoolDataProvider } = require("@aave/contract-helpers");
 import { logger } from "./logger.js";
 import { getAaveMarkets, setAaveMarkets } from "./db.js";
 
-const NETWORKS = [
+export const NETWORKS = [
   {
     key: "eth",
     name: "AaveV3Ethereum",
@@ -37,6 +37,16 @@ const NETWORKS = [
       "https://mainnet.base.org",
       "https://base-rpc.publicnode.com",
       "https://rpc.ankr.com/base"
+    ]
+  },
+  {
+    key: "polygon",
+    name: "AaveV3Polygon",
+    label: "Aave V3 Polygon",
+    defaultRpcUrls: [
+      "https://polygon-bor-rpc.publicnode.com",
+      "https://polygon-rpc.com",
+      "https://polygon.drpc.org"
     ]
   }
 ];
@@ -80,7 +90,7 @@ function createMarketClients(key, provider) {
   return { config, pool, ui };
 }
 
-async function withRpcFallback(key, fn) {
+export async function withRpcFallback(key, fn) {
   const urls = getRpcUrlsForNetwork(key);
   let lastError;
   for (const url of urls) {
