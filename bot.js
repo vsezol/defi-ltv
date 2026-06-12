@@ -134,16 +134,29 @@ function formatPoolPrice(value) {
   return value.toPrecision(4);
 }
 
+// Normalized position of the current price inside the range:
+// 0..1 in range (0 = lower bound, 1 = upper bound), <0 below, >1 above (shown as +X).
+function formatRangeCoord(position) {
+  const span = position.upperPrice - position.lowerPrice;
+  if (!Number.isFinite(span) || span <= 0) return "";
+  const coord = (position.currentPrice - position.lowerPrice) / span;
+  if (!Number.isFinite(coord)) return "";
+  return ` ${coord > 1 ? "+" : ""}${coord.toFixed(2)}`;
+}
+
 function formatPoolPosition(position, transition) {
   const prefix = position.inRange ? "✅ " : "🔴 ";
   let status = position.inRange ? "IN RANGE" : "OUT OF RANGE";
+  if (!position.isFullRange) {
+    status += formatRangeCoord(position);
+  }
   if (transition) {
     status += position.inRange ? " (was out of range)" : " (was in range)";
   }
   const range = position.isFullRange
     ? "Full range"
     : `Range: ${formatPoolPrice(position.lowerPrice)} — ${formatPoolPrice(position.upperPrice)} ${position.priceLabel}`;
-  return `${prefix}${position.pool}:\nStatus: ${status}\n${range}\nCurrent: ${formatPoolPrice(position.currentPrice)} ${position.priceLabel}`;
+  return `${prefix}${position.pool}:\nStatus: ${status}\n${range}`;
 }
 
 function mainMenu() {
@@ -249,8 +262,9 @@ function formatResultsByWallet(resultsByWallet) {
   const output = [];
   const protocolsOrder = ["kamino", "aave", "orca", "uniswap"];
   for (const [wallet, protocols] of resultsByWallet.entries()) {
-    output.push(`\`${wallet}\``);
     const protocolKeys = Object.keys(protocols);
+    if (protocolKeys.length === 0) continue;
+    output.push(`\`${wallet}\``);
     protocolKeys.sort((a, b) => {
       const aIdx = protocolsOrder.indexOf(a);
       const bIdx = protocolsOrder.indexOf(b);
@@ -366,8 +380,6 @@ async function checkWallets(ctx, user, protocolFilter) {
         }
         if (positions && positions.length > 0) {
           grouped.get(wallet)[protocol] = positions.map(p => formatPosition({ user, wallet, position: p }));
-        } else {
-          grouped.get(wallet)[protocol] = ["No positions"];
         }
       }
     } catch (error) {
@@ -389,7 +401,8 @@ async function checkWallets(ctx, user, protocolFilter) {
     }
   }
   await deleteMessage(ctx, statusMsg.message_id);
-  ctx.reply(formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+  const text = formatResultsByWallet(grouped);
+  ctx.reply(text || "No positions found", { parse_mode: "Markdown" });
 }
 
 async function refreshMarketsForUser(ctx, user, protocolFilter) {
