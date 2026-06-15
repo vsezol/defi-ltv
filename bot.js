@@ -3,6 +3,7 @@ import { fetchMarkets, scanAllMarketsForWallet, checkSpecificMarkets } from "./k
 import { fetchAaveMarketsAll, scanAaveMarketsForWallet, checkAaveMarkets } from "./aave.js";
 import { getOrcaPositionsForWallet } from "./orca.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
+import { getTronResources, tronReclaimInfo, computeTronFlags } from "./tron.js";
 import { loadDb, getUser, setUser, deleteUser, getUserCount, getAllUsers } from "./db.js";
 import { logger } from "./logger.js";
 
@@ -16,6 +17,7 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 
 const CHECK_INTERVAL = 10 * 60 * 1000;
+const TRON_CHECK_INTERVAL = 60 * 60 * 1000;
 
 // Code-level fallbacks. Used when neither the wallet nor the global defaults set a value.
 const DEFAULT_WARNING_HEALTH_FACTOR = 1.5;
@@ -55,13 +57,34 @@ function isEvmAddress(address) {
   return /^0x[a-fA-F0-9]{40}$/.test(address);
 }
 
-function isSolanaAddress(address) {
-  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address);
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Decode(str) {
+  if (!str || /[^123456789A-HJ-NP-Za-km-z]/.test(str)) return null;
+  let num = 0n;
+  for (const ch of str) {
+    num = num * 58n + BigInt(BASE58_ALPHABET.indexOf(ch));
+  }
+  const bytes = [];
+  while (num > 0n) {
+    bytes.unshift(Number(num & 0xffn));
+    num >>= 8n;
+  }
+  for (const ch of str) {
+    if (ch === "1") bytes.unshift(0);
+    else break;
+  }
+  return bytes;
 }
 
+// Tron decodes to 25 bytes (0x41 prefix + checksum); Solana pubkeys to 32 bytes.
 function detectWalletType(address) {
   if (isEvmAddress(address)) return "evm";
-  if (isSolanaAddress(address)) return "solana";
+  const bytes = base58Decode(address);
+  if (bytes) {
+    if (bytes.length === 25 && bytes[0] === 0x41) return "tron";
+    if (bytes.length === 32) return "solana";
+  }
   return "unknown";
 }
 
@@ -157,6 +180,46 @@ function formatPoolPosition(position, transition) {
     ? "Full range"
     : `Range: ${formatPoolPrice(position.lowerPrice)} — ${formatPoolPrice(position.upperPrice)} ${position.priceLabel}`;
   return `${prefix}${position.pool}:\nStatus: ${status}\n${range}`;
+}
+
+function fmtNum(n) {
+  if (!Number.isFinite(n)) return "?";
+  return Math.round(n).toLocaleString("en-US");
+}
+
+function fmtTrx(n) {
+  if (!Number.isFinite(n)) return "?";
+  return (Math.round(n * 100) / 100).toLocaleString("en-US");
+}
+
+function formatTronResources(res, now = Date.now()) {
+  const lines = [
+    `⚡ Energy: ${fmtNum(res.energyFree)} / ${fmtNum(res.energyTotal)} free`,
+    `📶 Bandwidth: ${fmtNum(res.bandwidthFree)} / ${fmtNum(res.bandwidthTotal)} free`
+  ];
+
+  if (res.hasDelegation) {
+    const parts = [];
+    if (res.delegatedEnergy > 0) {
+      parts.push(`${fmtNum(res.delegatedEnergy)} energy (${fmtTrx(res.delegatedEnergyTrx)} TRX)`);
+    }
+    if (res.delegatedBandwidth > 0) {
+      parts.push(`${fmtNum(res.delegatedBandwidth)} bandwidth (${fmtTrx(res.delegatedBandwidthTrx)} TRX)`);
+    }
+    lines.push(`Delegated out: ${parts.join(", ") || "yes"}`);
+
+    const { reclaimableNow, nextReclaimAt } = tronReclaimInfo(res, now);
+    if (reclaimableNow) {
+      lines.push("Reclaimable: now ✅");
+    } else if (nextReclaimAt) {
+      const days = Math.ceil((nextReclaimAt - now) / 86400000);
+      lines.push(`Reclaimable: ${new Date(nextReclaimAt).toISOString().slice(0, 10)} (in ${days} day${days === 1 ? "" : "s"})`);
+    }
+  } else {
+    lines.push("Delegated out: none");
+  }
+
+  return lines.join("\n");
 }
 
 function mainMenu() {
@@ -255,12 +318,13 @@ const PLATFORM_LABELS = {
   kamino: "*KAMINO*",
   aave: "*AAVE*",
   orca: "*ORCA*",
-  uniswap: "*UNISWAP*"
+  uniswap: "*UNISWAP*",
+  tron: "*TRON*"
 };
 
 function formatResultsByWallet(resultsByWallet) {
   const output = [];
-  const protocolsOrder = ["kamino", "aave", "orca", "uniswap"];
+  const protocolsOrder = ["kamino", "aave", "orca", "uniswap", "tron"];
   for (const [wallet, protocols] of resultsByWallet.entries()) {
     const protocolKeys = Object.keys(protocols);
     if (protocolKeys.length === 0) continue;
@@ -290,6 +354,9 @@ async function addWallet(ctx, wallet) {
   const walletType = detectWalletType(wallet);
   if (walletType === "unknown") {
     return ctx.reply("Unsupported wallet format");
+  }
+  if (walletType === "tron") {
+    return addTronWallet(ctx, wallet);
   }
   const protocol = walletType === "evm" ? "aave" : "kamino";
   const statusMsg = await ctx.reply(protocol === "aave" ? "Checking Aave..." : "Scanning all markets...");
@@ -334,6 +401,28 @@ async function addWallet(ctx, wallet) {
   }
 }
 
+async function addTronWallet(ctx, wallet) {
+  const chatId = String(ctx.chat.id);
+  const statusMsg = await ctx.reply("Checking Tron resources...");
+  try {
+    const res = await getTronResources(wallet);
+    await deleteMessage(ctx, statusMsg.message_id);
+    const user = ensureUser(chatId);
+    user.wallets[wallet] = {
+      protocol: "tron",
+      settings: {},
+      tronState: computeTronFlags(res)
+    };
+    setUser(chatId, user);
+    logger.info({ chatId, wallet }, "Tron wallet added");
+    ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n*TRON*\n${formatTronResources(res)}`, { parse_mode: "Markdown" });
+  } catch (error) {
+    await deleteMessage(ctx, statusMsg.message_id);
+    logger.error({ chatId, wallet, error: error.message }, "Failed to add Tron wallet");
+    ctx.reply(`Error: ${error.message}`);
+  }
+}
+
 function removeWallet(ctx, wallet) {
   if (!wallet) {
     return ctx.reply("Usage: /remove <wallet_address>");
@@ -368,6 +457,16 @@ async function checkWallets(ctx, user, protocolFilter) {
     if (!grouped.has(wallet)) grouped.set(wallet, {});
     const protocol = walletData.protocol || "kamino";
     const markets = walletData.markets || [];
+    if (protocol === "tron") {
+      try {
+        const res = await getTronResources(wallet);
+        grouped.get(wallet).tron = [formatTronResources(res)];
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Tron check failed");
+        grouped.get(wallet).tron = [`Error: ${error.message}`];
+      }
+      continue;
+    }
     try {
       if (protocol === "kamino" && markets.length === 0) {
         grouped.get(wallet)[protocol] = ["No markets cached. Use Refresh All"];
@@ -449,10 +548,12 @@ async function refreshMarketsForUser(ctx, user, protocolFilter) {
 bot.start((ctx) => {
   ctx.reply(
     "LTV Watch Bot\n\n" +
-    "Monitors Health Factor / LTV / borrow rate (Kamino, Aave) and\n" +
-    "LP position ranges (Orca, Uniswap V3) for your wallets.\n\n" +
+    "Monitors for your wallets:\n" +
+    "• Health Factor / LTV / borrow rate (Kamino, Aave)\n" +
+    "• LP position ranges (Orca, Uniswap V3)\n" +
+    "• Tron resources: energy/bandwidth, delegation & reclaim\n\n" +
     "/menu - open menu (wallets, thresholds, checks)\n" +
-    "/checkall - check all positions (lending + pools)"
+    "/checkall - check all positions (lending + pools + Tron)"
   );
 });
 
@@ -746,6 +847,7 @@ async function checkAllUsers() {
       if (!user.wallets) continue;
 
       for (const [wallet, walletData] of Object.entries(user.wallets)) {
+        if ((walletData.protocol || "") === "tron") continue; // Tron has its own slower loop
         try {
           await checkLendingForWallet(chatId, user, wallet, walletData);
         } catch (error) {
@@ -766,6 +868,61 @@ async function checkAllUsers() {
   }
 }
 
+// Notify on transition into an actionable state (false -> true):
+// - reclaim:  a delegation unlocked and there's bandwidth to reclaim it
+// - delegate: resources are free and nothing is delegated
+// First sighting just records the baseline silently (the add/check output
+// already shows the current state).
+async function checkTronForWallet(chatId, wallet, walletData) {
+  const res = await getTronResources(wallet);
+  const flags = computeTronFlags(res);
+  const prev = walletData.tronState;
+
+  if (!prev) {
+    walletData.tronState = flags;
+    logger.info({ chatId, wallet, flags }, "Tron baseline recorded");
+    return;
+  }
+
+  const notes = [];
+  if (flags.reclaim && !prev.reclaim) {
+    notes.push("🔓 Resources ready to reclaim (delegation unlocked)");
+  }
+  if (flags.delegate && !prev.delegate) {
+    notes.push("🟢 Resources free to delegate");
+  }
+
+  if (notes.length > 0) {
+    logger.info({ chatId, wallet, notes }, "Tron transition");
+    const body = `\`${wallet}\`\n\n*TRON*\n${notes.join("\n")}\n\n${formatTronResources(res)}`;
+    // Send before persisting: a failed send keeps the old state so it retries.
+    await bot.telegram.sendMessage(chatId, body, { parse_mode: "Markdown" });
+  }
+
+  walletData.tronState = flags;
+}
+
+async function checkAllTron() {
+  try {
+    for (const [chatId, user] of getAllUsers()) {
+      if (!user.wallets) continue;
+      let touched = false;
+      for (const [wallet, walletData] of Object.entries(user.wallets)) {
+        if ((walletData.protocol || "") !== "tron") continue;
+        try {
+          await checkTronForWallet(chatId, wallet, walletData);
+          touched = true;
+        } catch (error) {
+          logger.error({ chatId, wallet, error: error.message }, "Tron check failed");
+        }
+      }
+      if (touched) setUser(chatId, user);
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, "Tron check cycle failed");
+  }
+}
+
 async function init() {
   try {
     await fetchMarkets();
@@ -776,11 +933,12 @@ async function init() {
 
   setInterval(refreshMarketsBackground, CHECK_INTERVAL);
   setInterval(checkAllUsers, CHECK_INTERVAL);
+  setInterval(checkAllTron, TRON_CHECK_INTERVAL);
 
   try {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
-      { command: "checkall", description: "Check all positions (lending + pools)" }
+      { command: "checkall", description: "Check all positions (lending + pools + Tron)" }
     ]);
   } catch (error) {
     logger.error({ error: error.message }, "Failed to set bot commands");
@@ -790,6 +948,7 @@ async function init() {
   if (userCount > 0) {
     logger.info({ count: userCount }, "Users loaded");
     setTimeout(checkAllUsers, 5000);
+    setTimeout(checkAllTron, 15000);
   }
 
   bot.launch();
