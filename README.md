@@ -71,6 +71,7 @@ npm run dev            # loads .env automatically (--env-file=.env)
 | :--- | :--- | :--- |
 | `BOT_TOKEN` | yes | Telegram bot token from @BotFather. |
 | `NODE_ENV` | no | `production` → plain JSON logs; anything else → pretty dev logs. |
+| `SOLANA_RPC_URL` | no | Solana RPC URL(s) for Orca scanning (comma-separated). Many public RPCs now block `getTokenAccountsByOwner`; set a private endpoint for reliable Orca monitoring. Falls back to keyless public RPCs. |
 
 ## Bot commands
 

@@ -1,7 +1,17 @@
 import { logger } from "./logger.js";
 
 const ORCA_API = "https://api.orca.so/v2/solana";
+// Many public RPCs now block getTokenAccountsByOwner with a programId filter
+// ("Request blocked"). Set SOLANA_RPC_URL (comma-separated allowed) to a private
+// endpoint for best reliability; the keyless defaults below still allow the method.
+const ENV_RPCS = (process.env.SOLANA_RPC_URL || "")
+  .split(",")
+  .map((url) => url.trim())
+  .filter(Boolean);
 const SOLANA_RPCS = [
+  ...ENV_RPCS,
+  "https://solana.lava.build",
+  "https://rpc.magicblock.app/mainnet",
   "https://api.mainnet-beta.solana.com",
   "https://solana-rpc.publicnode.com"
 ];
