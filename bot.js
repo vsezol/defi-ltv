@@ -196,7 +196,7 @@ function formatLpPool(c, i) {
   const ratioVal = c.ratio >= 0 ? c.ratio.toFixed(1) : "?";
   return (
     `${i + 1}. ${name}  ${c.feeLabel} ${c.version} · ${c.chain}\n` +
-    `ratio *${ratioVal}* · 7d ${fmtUsd(c.vol7d)} · TVL ${fmtUsd(c.tvl)}`
+    `ratio *${ratioVal}* · 30d ${fmtUsd(c.vol30d)} · TVL ${fmtUsd(c.tvl)}`
   );
 }
 
@@ -209,7 +209,7 @@ function formatLpList(pools) {
 function formatTopLpMessages(result, title) {
   const chainsList = result.chains.map((c, i) => `${i + 1}. ${c.name} — ${fmtUsd(c.tvl)}`).join("\n");
   return [
-    `*${title} — 7d vol / TVL*\n\nTop chains by TVL:\n${chainsList}`,
+    `*${title} — 30d vol / TVL*\n\nTop chains by TVL:\n${chainsList}`,
     `*BTC / stablecoin*\n\n${formatLpList(result.btc)}`,
     `*ETH / stablecoin*\n\n${formatLpList(result.eth)}`
   ];
@@ -616,7 +616,7 @@ bot.start((ctx) => {
     "Send wallet address(es) — one per line — to start monitoring them.\n\n" +
     "/menu - open menu (wallets, thresholds, checks)\n" +
     "/checkall - check all positions (lending + pools + Tron)\n" +
-    "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 7d vol/TVL\n" +
+    "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 30d vol/TVL\n" +
     "/toplpl2 - same, excluding Ethereum L1 (lower gas chains only)"
   );
 });
@@ -1033,7 +1033,7 @@ async function init() {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
       { command: "checkall", description: "Check all positions (lending + pools + Tron)" },
-      { command: "toplp", description: "Top Uniswap LP pools (BTC/ETH vs stables) by 7d vol/TVL" },
+      { command: "toplp", description: "Top Uniswap LP pools (BTC/ETH vs stables) by 30d vol/TVL" },
       { command: "toplpl2", description: "Top LP excluding Ethereum L1 (L2/sidechains only)" }
     ]);
   } catch (error) {
