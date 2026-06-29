@@ -11,6 +11,10 @@ Telegram bot that monitors your DeFi positions:
 - **Tron resources** — staked **energy/bandwidth**, outgoing delegations and
   their reclaim dates, alerting when delegated resources become reclaimable or
   when free resources can be (re)delegated.
+- **Top LP discovery** (`/toplp`, `/toplpl2`) — ranks Uniswap v3/v4 BTC and ETH
+  pools **paired with USDC/USDT** across the top-5 EVM chains by **7d volume / TVL**
+  (capital efficiency), liquidity > $100k. Two lists (BTC, ETH), top 10 each, with
+  direct Uniswap links. `/toplpl2` excludes Ethereum L1 (lower-gas chains only).
 
 ## How it works
 
@@ -48,6 +52,7 @@ files (`db-kamino.json`, `db-aave.json`), created on first run.
 | `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
 | `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
+| `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH) by 30d-volume/TVL across top EVM chains, via DefiLlama (chain TVL + yields). |
 | `db.js` | File-based storage for users, wallets, settings and market cache. |
 | `logger.js` | Logging (pino; pretty output in dev). |
 
@@ -79,5 +84,7 @@ Everything is driven through the interactive menu:
 
 - `/menu` — open the menu: add/remove wallets, tap a wallet under **Wallets** to
   edit its thresholds, **Settings** edits the global defaults, **Check All** /
-  **Refresh All** run checks.
-- `/checkall` — check all positions now (lending + LP pools).
+  **Refresh All** run checks, **Top LP** / **Top LP (L2)** rank pools.
+- `/checkall` — check all positions now (lending + LP pools + Tron).
+- `/toplp` — top Uniswap v3/v4 BTC/ETH-vs-stable pools by 7d volume / TVL.
+- `/toplpl2` — same, excluding Ethereum L1 (lower-gas chains only).

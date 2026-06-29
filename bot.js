@@ -4,6 +4,7 @@ import { fetchAaveMarketsAll, scanAaveMarketsForWallet, checkAaveMarkets } from 
 import { getOrcaPositionsForWallet } from "./orca.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, tronReclaimInfo, computeTronFlags } from "./tron.js";
+import { getTopLpPools } from "./toplp.js";
 import { loadDb, getUser, setUser, deleteUser, getUserCount, getAllUsers } from "./db.js";
 import { logger } from "./logger.js";
 
@@ -182,6 +183,40 @@ function formatPoolPosition(position, transition) {
   return `${prefix}${position.pool}:\nStatus: ${status}\n${range}`;
 }
 
+function fmtUsd(n) {
+  if (!Number.isFinite(n)) return "?";
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+  return `$${Math.round(n)}`;
+}
+
+function formatLpPool(c, i) {
+  const name = c.url ? `[${c.symbol}](${c.url})` : c.symbol;
+  const ratioVal = c.ratio >= 0 ? c.ratio.toFixed(1) : "?";
+  return (
+    `${i + 1}. ${name}  ${c.feeLabel} ${c.version} · ${c.chain}\n` +
+    `ratio *${ratioVal}* · 7d ${fmtUsd(c.vol7d)} · TVL ${fmtUsd(c.tvl)}`
+  );
+}
+
+function formatLpList(pools) {
+  return pools.length ? pools.map(formatLpPool).join("\n\n") : "none";
+}
+
+// Two messages (BTC, ETH) — keeps each under Telegram's size limit and reads
+// better on mobile.
+function formatTopLpMessages(result, title) {
+  const header =
+    `*${title} — 7d vol / TVL*\n` +
+    `Chains: ${result.chains.map((c) => c.name).join(", ")}`;
+  const legend = "_Uniswap v3/v4, TVL > $100k, vs USDC/USDT · ratio = 7d vol / TVL · tap a pair to open_";
+  return [
+    `${header}\n\n*₿ BTC / stablecoin*\n\n${formatLpList(result.btc)}`,
+    `*Ξ ETH / stablecoin*\n\n${formatLpList(result.eth)}\n\n${legend}`
+  ];
+}
+
 function fmtNum(n) {
   if (!Number.isFinite(n)) return "?";
   return Math.round(n).toLocaleString("en-US");
@@ -231,6 +266,10 @@ function mainMenu() {
     [
       Markup.button.callback("Check All", "action:check:all"),
       Markup.button.callback("Refresh All", "action:refresh:all")
+    ],
+    [
+      Markup.button.callback("Top LP", "action:toplp"),
+      Markup.button.callback("Top LP (L2)", "action:toplpl2")
     ],
     [Markup.button.callback("Wallets", "menu:wallets")],
     [Markup.button.callback("Settings", "menu:settings")]
@@ -553,7 +592,9 @@ bot.start((ctx) => {
     "• LP position ranges (Orca, Uniswap V3)\n" +
     "• Tron resources: energy/bandwidth, delegation & reclaim\n\n" +
     "/menu - open menu (wallets, thresholds, checks)\n" +
-    "/checkall - check all positions (lending + pools + Tron)"
+    "/checkall - check all positions (lending + pools + Tron)\n" +
+    "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 7d vol/TVL\n" +
+    "/toplpl2 - same, excluding Ethereum L1 (lower gas chains only)"
   );
 });
 
@@ -565,6 +606,34 @@ bot.command("checkall", async (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
   await checkWallets(ctx, user, "all");
+});
+
+async function runTopLp(ctx, options, title) {
+  const statusMsg = await ctx.reply("Scanning top chains & Uniswap pools...");
+  try {
+    const result = await getTopLpPools(options);
+    await deleteMessage(ctx, statusMsg.message_id);
+    for (const msg of formatTopLpMessages(result, title)) {
+      await ctx.reply(msg, { parse_mode: "Markdown", disable_web_page_preview: true });
+    }
+  } catch (error) {
+    await deleteMessage(ctx, statusMsg.message_id);
+    logger.error({ error: error.message }, "Top LP failed");
+    await ctx.reply(`Error: ${error.message}`);
+  }
+}
+
+bot.command("toplp", (ctx) => runTopLp(ctx, {}, "Top LP"));
+bot.command("toplpl2", (ctx) => runTopLp(ctx, { excludeChains: ["Ethereum"] }, "Top LP (L2 only)"));
+
+bot.action("action:toplp", async (ctx) => {
+  await ctx.answerCbQuery();
+  await runTopLp(ctx, {}, "Top LP");
+});
+
+bot.action("action:toplpl2", async (ctx) => {
+  await ctx.answerCbQuery();
+  await runTopLp(ctx, { excludeChains: ["Ethereum"] }, "Top LP (L2 only)");
 });
 
 bot.action("menu:main", async (ctx) => {
@@ -938,7 +1007,9 @@ async function init() {
   try {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
-      { command: "checkall", description: "Check all positions (lending + pools + Tron)" }
+      { command: "checkall", description: "Check all positions (lending + pools + Tron)" },
+      { command: "toplp", description: "Top Uniswap LP pools (BTC/ETH vs stables) by 7d vol/TVL" },
+      { command: "toplpl2", description: "Top LP excluding Ethereum L1 (L2/sidechains only)" }
     ]);
   } catch (error) {
     logger.error({ error: error.message }, "Failed to set bot commands");
