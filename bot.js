@@ -460,6 +460,30 @@ async function addTronWallet(ctx, wallet) {
   }
 }
 
+const ADD_BATCH_SIZE = 5;
+
+// Accepts one or many addresses (whitespace / newline / comma separated) and adds
+// each. Unrecognised tokens are ignored. Parallel in batches so a pasted list is
+// added quickly; addWallet's read-modify-write of storage is synchronous, so the
+// concurrent commits don't race.
+async function addWallets(ctx, rawText, opts = {}) {
+  const tokens = String(rawText || "").split(/[\s,]+/).map((w) => w.trim()).filter(Boolean);
+  const wallets = [...new Set(tokens.filter((w) => detectWalletType(w) !== "unknown"))];
+
+  if (wallets.length === 0) {
+    if (!opts.silentIfNone) await ctx.reply("Send a wallet address (or several, one per line)");
+    return;
+  }
+  if (wallets.length === 1) {
+    return addWallet(ctx, wallets[0]);
+  }
+
+  await ctx.reply(`Adding ${wallets.length} wallets...`);
+  for (let i = 0; i < wallets.length; i += ADD_BATCH_SIZE) {
+    await Promise.all(wallets.slice(i, i + ADD_BATCH_SIZE).map((w) => addWallet(ctx, w)));
+  }
+}
+
 function removeWallet(ctx, wallet) {
   if (!wallet) {
     return ctx.reply("Usage: /remove <wallet_address>");
@@ -589,6 +613,7 @@ bot.start((ctx) => {
     "• Health Factor / LTV / borrow rate (Kamino, Aave)\n" +
     "• LP position ranges (Orca, Uniswap V3)\n" +
     "• Tron resources: energy/bandwidth, delegation & reclaim\n\n" +
+    "Send wallet address(es) — one per line — to start monitoring them.\n\n" +
     "/menu - open menu (wallets, thresholds, checks)\n" +
     "/checkall - check all positions (lending + pools + Tron)\n" +
     "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 7d vol/TVL\n" +
@@ -690,7 +715,7 @@ bot.action("action:addwallet", async (ctx) => {
   const user = ensureUser(chatId);
   user.ui.pending = { action: "addwallet" };
   setUser(chatId, user);
-  await ctx.reply("Send wallet address to add");
+  await ctx.reply("Send wallet address to add (or several, one per line)");
 });
 
 bot.action(/wallet:open:(\d+)/, async (ctx) => {
@@ -779,15 +804,14 @@ bot.on("text", async (ctx, next) => {
   const chatId = String(ctx.chat.id);
   const user = ensureUser(chatId);
   const pending = user.ui?.pending;
-  if (!pending) return;
 
-  if (pending.action === "addwallet") {
+  if (pending?.action === "addwallet") {
     user.ui.pending = null;
     setUser(chatId, user);
-    return addWallet(ctx, text.trim());
+    return addWallets(ctx, text);
   }
 
-  if (pending.action === "setwallet" || pending.action === "setdefault") {
+  if (pending?.action === "setwallet" || pending?.action === "setdefault") {
     const value = parseFloat(text);
     const field = THRESHOLD_FIELDS[pending.field];
     if (!field) {
@@ -819,6 +843,9 @@ bot.on("text", async (ctx, next) => {
     logger.info({ chatId, wallet, field: field.key, value }, "Wallet threshold set");
     return ctx.reply(`${field.label} for ${formatWalletLabel(wallet)} set to ${formatThresholdValue(field, value)}`);
   }
+
+  // No pending step — a plain message containing wallet address(es) is an add.
+  return addWallets(ctx, text, { silentIfNone: true });
 });
 
 async function refreshMarketsBackground() {
