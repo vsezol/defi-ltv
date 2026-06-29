@@ -204,16 +204,14 @@ function formatLpList(pools) {
   return pools.length ? pools.map(formatLpPool).join("\n\n") : "none";
 }
 
-// Two messages (BTC, ETH) — keeps each under Telegram's size limit and reads
-// better on mobile.
+// Three messages (chains, BTC, ETH) — keeps each under Telegram's size limit
+// and reads better on mobile.
 function formatTopLpMessages(result, title) {
-  const header =
-    `*${title} — 7d vol / TVL*\n` +
-    `Chains: ${result.chains.map((c) => c.name).join(", ")}`;
-  const legend = "_Uniswap v3/v4, TVL > $100k, vs USDC/USDT · ratio = 7d vol / TVL · tap a pair to open_";
+  const chainsList = result.chains.map((c, i) => `${i + 1}. ${c.name} — ${fmtUsd(c.tvl)}`).join("\n");
   return [
-    `${header}\n\n*₿ BTC / stablecoin*\n\n${formatLpList(result.btc)}`,
-    `*Ξ ETH / stablecoin*\n\n${formatLpList(result.eth)}\n\n${legend}`
+    `*${title} — 7d vol / TVL*\n\nTop chains by TVL:\n${chainsList}`,
+    `*BTC / stablecoin*\n\n${formatLpList(result.btc)}`,
+    `*ETH / stablecoin*\n\n${formatLpList(result.eth)}`
   ];
 }
 
