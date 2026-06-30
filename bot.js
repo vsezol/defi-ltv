@@ -1,4 +1,4 @@
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf, Markup, session } from "telegraf";
 import { fetchMarkets, scanAllMarketsForWallet, checkSpecificMarkets } from "./kamino.js";
 import { fetchAaveMarketsAll, scanAaveMarketsForWallet, checkAaveMarkets } from "./aave.js";
 import { getOrcaPositionsForWallet } from "./orca.js";
@@ -31,6 +31,10 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// Transient per-chat UI state (pending input, menu index, current wallet) lives in
+// ctx.session, backed by the swappable keyv store (in-memory now, Redis via REDIS_URL).
+bot.use(session({ store: uiCache, defaultSession: () => ({}) }));
 
 const CHECK_INTERVAL = 10 * 60 * 1000;
 const TRON_CHECK_INTERVAL = 60 * 60 * 1000;
@@ -102,19 +106,13 @@ function detectWalletType(address) {
   return "unknown";
 }
 
-// Durable data (wallets, settings) comes from Postgres; transient UI state
-// (pending input, menu index, current wallet) lives in the ephemeral cache.
+// Durable data (wallets, settings) comes from Postgres. Transient UI state lives
+// in ctx.session, so handlers read/write ctx.session.* directly (no manual save).
 async function ensureUser(chatId) {
   const user = (await getUser(chatId)) || {};
   if (!user.wallets) user.wallets = {};
   if (!user.settings) user.settings = {};
-  user.ui = (await uiCache.get(chatId)) || {};
   return user;
-}
-
-// Persist the transient UI state for a chat (replaces the old setUser-for-ui pattern).
-async function saveUi(chatId, user) {
-  await uiCache.set(chatId, user.ui || {});
 }
 
 // User-configurable global defaults, falling back to code constants.
@@ -326,7 +324,6 @@ function formatWalletLabel(wallet) {
 function walletMenu(user) {
   const rows = [];
   const wallets = Object.keys(user?.wallets || {});
-  user.ui.walletMenu = wallets;
   for (let i = 0; i < wallets.length; i += 1) {
     const wallet = wallets[i];
     rows.push([
@@ -686,17 +683,13 @@ bot.action("menu:wallets", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
+  ctx.session.walletMenu = Object.keys(user.wallets || {});
   await ctx.editMessageText("Wallets", walletMenu(user));
-  await saveUi(chatId, user);
 });
 
 bot.action(/menu:protocol:(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const protocol = ctx.match[1];
-  const chatId = String(ctx.chat.id);
-  const user = await ensureUser(chatId);
-  user.ui.protocol = protocol;
-  await saveUi(chatId, user);
   await ctx.editMessageText(`${protocol.toUpperCase()} menu`, protocolMenu(protocol));
 });
 
@@ -718,10 +711,7 @@ bot.action(/action:refresh:(.+)/, async (ctx) => {
 
 bot.action("action:addwallet", async (ctx) => {
   await ctx.answerCbQuery();
-  const chatId = String(ctx.chat.id);
-  const user = await ensureUser(chatId);
-  user.ui.pending = { action: "addwallet" };
-  await saveUi(chatId, user);
+  ctx.session.pending = { action: "addwallet" };
   await ctx.reply("Send wallet address to add (or several, one per line)");
 });
 
@@ -730,12 +720,11 @@ bot.action(/wallet:open:(\d+)/, async (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
   const index = Number(ctx.match[1]);
-  const wallet = user.ui.walletMenu?.[index];
+  const wallet = ctx.session.walletMenu?.[index];
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
-  user.ui.currentWallet = wallet;
-  await saveUi(chatId, user);
+  ctx.session.currentWallet = wallet;
   await ctx.editMessageText(formatWalletSettings(user, wallet), {
     parse_mode: "Markdown",
     ...walletSettingsMenu(user, wallet)
@@ -745,16 +734,15 @@ bot.action(/wallet:open:(\d+)/, async (ctx) => {
 bot.action(/wallet:remove:(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  let user = await ensureUser(chatId);
   const index = Number(ctx.match[1]);
-  const wallet = user.ui.walletMenu?.[index];
+  const wallet = ctx.session.walletMenu?.[index];
   if (!wallet) {
     return ctx.reply("Wallet not found");
   }
   await removeWallet(ctx, wallet);
-  user = await ensureUser(chatId);
+  const user = await ensureUser(chatId);
+  ctx.session.walletMenu = Object.keys(user.wallets || {});
   await ctx.editMessageText("Wallets", walletMenu(user));
-  await saveUi(chatId, user);
 });
 
 bot.action(/wallet:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
@@ -762,12 +750,11 @@ bot.action(/wallet:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
   const field = ctx.match[1];
-  const wallet = user.ui.currentWallet;
+  const wallet = ctx.session.currentWallet;
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
-  user.ui.pending = { action: "setwallet", field, wallet };
-  await saveUi(chatId, user);
+  ctx.session.pending = { action: "setwallet", field, wallet };
   await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} for ${formatWalletLabel(wallet)}`);
 });
 
@@ -775,7 +762,7 @@ bot.action("wallet:reset", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
-  const wallet = user.ui.currentWallet;
+  const wallet = ctx.session.currentWallet;
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
@@ -791,17 +778,14 @@ bot.action("wallet:back", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
+  ctx.session.walletMenu = Object.keys(user.wallets || {});
   await ctx.editMessageText("Wallets", walletMenu(user));
-  await saveUi(chatId, user);
 });
 
 bot.action(/def:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
   await ctx.answerCbQuery();
-  const chatId = String(ctx.chat.id);
-  const user = await ensureUser(chatId);
   const field = ctx.match[1];
-  user.ui.pending = { action: "setdefault", field };
-  await saveUi(chatId, user);
+  ctx.session.pending = { action: "setdefault", field };
   await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} (global default)`);
 });
 
@@ -809,12 +793,10 @@ bot.on("text", async (ctx, next) => {
   const text = ctx.message.text;
   if (text.startsWith("/")) return next();
   const chatId = String(ctx.chat.id);
-  const user = await ensureUser(chatId);
-  const pending = user.ui?.pending;
+  const pending = ctx.session.pending;
 
   if (pending?.action === "addwallet") {
-    user.ui.pending = null;
-    await saveUi(chatId, user);
+    ctx.session.pending = null;
     return addWallets(ctx, text);
   }
 
@@ -822,16 +804,14 @@ bot.on("text", async (ctx, next) => {
     const value = parseFloat(text);
     const field = THRESHOLD_FIELDS[pending.field];
     if (!field) {
-      user.ui.pending = null;
-      await saveUi(chatId, user);
+      ctx.session.pending = null;
       return ctx.reply("Unknown setting");
     }
     if (!Number.isFinite(value) || value <= 0) {
       return ctx.reply("Send a positive number");
     }
 
-    user.ui.pending = null;
-    await saveUi(chatId, user);
+    ctx.session.pending = null;
 
     if (pending.action === "setdefault") {
       await setGlobalThreshold(chatId, field.key, value);
@@ -840,6 +820,7 @@ bot.on("text", async (ctx, next) => {
     }
 
     const wallet = pending.wallet;
+    const user = await ensureUser(chatId);
     if (!wallet || !user.wallets[wallet]) {
       return ctx.reply("Wallet not found");
     }
