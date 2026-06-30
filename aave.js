@@ -5,7 +5,9 @@ const addressBook = require("@bgd-labs/aave-address-book");
 const { IPool__factory } = require("@aave/contract-helpers/dist/cjs/v3-pool-contract/typechain/IPool__factory.js");
 const { UiPoolDataProvider } = require("@aave/contract-helpers");
 import { logger } from "./logger.js";
-import { getAaveMarkets, setAaveMarkets } from "./db.js";
+import { marketsCache } from "./cache.js";
+
+const marketsKey = (networkKey) => `aave:${networkKey}`;
 
 export const NETWORKS = [
   {
@@ -115,7 +117,7 @@ async function fetchAaveMarketsForNetwork(key) {
       underlyingAsset: reserve.underlyingAsset,
       decimals: reserve.decimals
     }));
-    setAaveMarkets(key, markets);
+    await marketsCache.set(marketsKey(key), markets);
     return markets;
   });
 }
@@ -134,7 +136,7 @@ export async function fetchAaveMarketsAll() {
 }
 
 async function getCachedAaveMarkets(key) {
-  const cached = getAaveMarkets(key);
+  const cached = await marketsCache.get(marketsKey(key));
   if (cached && cached.length > 0) return cached;
   return fetchAaveMarketsForNetwork(key);
 }

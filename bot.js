@@ -5,7 +5,22 @@ import { getOrcaPositionsForWallet } from "./orca.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, tronReclaimInfo, computeTronFlags } from "./tron.js";
 import { getTopLpPools } from "./toplp.js";
-import { loadDb, getUser, setUser, deleteUser, getUserCount, getAllUsers } from "./db.js";
+import {
+  initDb,
+  closeDb,
+  getUser,
+  getAllUsers,
+  getUserCount,
+  upsertWallet,
+  deleteWallet,
+  setGlobalThreshold,
+  setWalletThreshold,
+  resetWalletThresholds,
+  setWalletMarkets,
+  setWalletPoolStates,
+  setWalletTronState
+} from "./db.js";
+import { uiCache } from "./cache.js";
 import { logger } from "./logger.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -35,8 +50,6 @@ const THRESHOLD_FIELDS = {
   wbr: { key: "warningBorrowRate", label: "Warning Rate", kind: "rate" },
   dbr: { key: "dangerBorrowRate", label: "Danger Rate", kind: "rate" }
 };
-
-loadDb();
 
 async function deleteMessage(ctx, messageId) {
   try {
@@ -89,13 +102,19 @@ function detectWalletType(address) {
   return "unknown";
 }
 
-function ensureUser(chatId) {
-  let user = getUser(chatId);
-  if (!user) user = {};
+// Durable data (wallets, settings) comes from Postgres; transient UI state
+// (pending input, menu index, current wallet) lives in the ephemeral cache.
+async function ensureUser(chatId) {
+  const user = (await getUser(chatId)) || {};
   if (!user.wallets) user.wallets = {};
   if (!user.settings) user.settings = {};
-  if (!user.ui) user.ui = {};
+  user.ui = (await uiCache.get(chatId)) || {};
   return user;
+}
+
+// Persist the transient UI state for a chat (replaces the old setUser-for-ui pattern).
+async function saveUi(chatId, user) {
+  await uiCache.set(chatId, user.ui || {});
 }
 
 // User-configurable global defaults, falling back to code constants.
@@ -416,18 +435,17 @@ async function addWallet(ctx, wallet) {
     if ((!positions || positions.length === 0) && pools.length === 0) {
       return ctx.reply("No positions found for this wallet");
     }
-    const user = ensureUser(chatId);
     const marketNames = (positions || []).map(p => p.market);
     const poolStates = {};
     for (const pool of pools) poolStates[pool.id] = pool.inRange;
-    user.wallets[wallet] = {
-      markets: marketNames,
-      protocol,
-      settings: {},
-      poolStates
-    };
-    setUser(chatId, user);
+    try {
+      await upsertWallet(chatId, wallet, { protocol, markets: marketNames, poolStates });
+    } catch (error) {
+      logger.error({ chatId, wallet, error: error.message }, "Failed to save wallet");
+      return ctx.reply(`Scanned ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
+    }
     logger.info({ chatId, wallet, markets: marketNames, pools: pools.length }, "Wallet added");
+    const user = await getUser(chatId);
     const lines = (positions || []).map(p => formatPosition({ user, wallet, position: p }));
     lines.push(...pools.map(p => formatPoolPosition(p)));
     ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
@@ -444,13 +462,12 @@ async function addTronWallet(ctx, wallet) {
   try {
     const res = await getTronResources(wallet);
     await deleteMessage(ctx, statusMsg.message_id);
-    const user = ensureUser(chatId);
-    user.wallets[wallet] = {
-      protocol: "tron",
-      settings: {},
-      tronState: computeTronFlags(res)
-    };
-    setUser(chatId, user);
+    try {
+      await upsertWallet(chatId, wallet, { protocol: "tron", tronState: computeTronFlags(res) });
+    } catch (error) {
+      logger.error({ chatId, wallet, error: error.message }, "Failed to save Tron wallet");
+      return ctx.reply(`Checked ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
+    }
     logger.info({ chatId, wallet }, "Tron wallet added");
     ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n*TRON*\n${formatTronResources(res)}`, { parse_mode: "Markdown" });
   } catch (error) {
@@ -464,8 +481,8 @@ const ADD_BATCH_SIZE = 5;
 
 // Accepts one or many addresses (whitespace / newline / comma separated) and adds
 // each. Unrecognised tokens are ignored. Parallel in batches so a pasted list is
-// added quickly; addWallet's read-modify-write of storage is synchronous, so the
-// concurrent commits don't race.
+// added quickly; each add is an atomic per-row UPSERT, so concurrent commits don't
+// race, and addWallet swallows its own errors so one failure can't sink the batch.
 async function addWallets(ctx, rawText, opts = {}) {
   const tokens = String(rawText || "").split(/[\s,]+/).map((w) => w.trim()).filter(Boolean);
   const wallets = [...new Set(tokens.filter((w) => detectWalletType(w) !== "unknown"))];
@@ -484,21 +501,16 @@ async function addWallets(ctx, rawText, opts = {}) {
   }
 }
 
-function removeWallet(ctx, wallet) {
+async function removeWallet(ctx, wallet) {
   if (!wallet) {
     return ctx.reply("Usage: /remove <wallet_address>");
   }
   const chatId = String(ctx.chat.id);
-  const user = getUser(chatId);
+  const user = await getUser(chatId);
   if (!user || !user.wallets || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
-  delete user.wallets[wallet];
-  if (Object.keys(user.wallets).length === 0) {
-    deleteUser(chatId);
-  } else {
-    setUser(chatId, user);
-  }
+  await deleteWallet(chatId, wallet);
   logger.info({ chatId, wallet }, "Wallet removed");
   ctx.reply(`Wallet removed\n\n\`${wallet}\``, { parse_mode: "Markdown" });
 }
@@ -573,6 +585,7 @@ async function refreshMarketsForUser(ctx, user, protocolFilter) {
   if (wallets.length === 0) {
     return ctx.reply("No wallets configured");
   }
+  const chatId = String(ctx.chat.id);
   const statusMsg = await ctx.reply("Rescanning markets...");
   const grouped = new Map();
   for (const [wallet, walletData] of wallets) {
@@ -584,24 +597,19 @@ async function refreshMarketsForUser(ctx, user, protocolFilter) {
       } else {
         positions = await scanAllMarketsForWallet(wallet);
       }
-      if (positions && positions.length > 0) {
-        const marketNames = positions.map(p => p.market);
-        walletData.markets = marketNames;
-        const lines = positions.map(p => formatPosition({ user, wallet, position: p }));
-        if (!grouped.has(wallet)) grouped.set(wallet, {});
-        grouped.get(wallet)[protocol] = lines;
-      } else {
-        walletData.markets = [];
-        if (!grouped.has(wallet)) grouped.set(wallet, {});
-        grouped.get(wallet)[protocol] = ["No positions found"];
-      }
+      const marketNames = (positions || []).map(p => p.market);
+      walletData.markets = marketNames;
+      await setWalletMarkets(chatId, wallet, marketNames);
+      if (!grouped.has(wallet)) grouped.set(wallet, {});
+      grouped.get(wallet)[protocol] = positions && positions.length > 0
+        ? positions.map(p => formatPosition({ user, wallet, position: p }))
+        : ["No positions found"];
     } catch (error) {
       logger.error({ wallet, error: error.message }, "Refresh failed");
       if (!grouped.has(wallet)) grouped.set(wallet, {});
       grouped.get(wallet)[walletData.protocol || "kamino"] = [`Error: ${error.message}`];
     }
   }
-  setUser(String(ctx.chat.id), user);
   await deleteMessage(ctx, statusMsg.message_id);
   ctx.reply(`Markets refreshed\n\n${formatResultsByWallet(grouped)}`, { parse_mode: "Markdown" });
 }
@@ -627,7 +635,7 @@ bot.command("menu", (ctx) => {
 
 bot.command("checkall", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await checkWallets(ctx, user, "all");
 });
 
@@ -667,29 +675,28 @@ bot.action("menu:main", async (ctx) => {
 bot.action("menu:settings", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await ctx.editMessageText(
     "Global default thresholds.\nApplied to wallets that don't override them.",
     settingsMenu(user)
   );
-  setUser(chatId, user);
 });
 
 bot.action("menu:wallets", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await ctx.editMessageText("Wallets", walletMenu(user));
-  setUser(chatId, user);
+  await saveUi(chatId, user);
 });
 
 bot.action(/menu:protocol:(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const protocol = ctx.match[1];
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   user.ui.protocol = protocol;
-  setUser(chatId, user);
+  await saveUi(chatId, user);
   await ctx.editMessageText(`${protocol.toUpperCase()} menu`, protocolMenu(protocol));
 });
 
@@ -697,7 +704,7 @@ bot.action(/action:check:(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const protocol = ctx.match[1];
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await checkWallets(ctx, user, protocol);
 });
 
@@ -705,30 +712,30 @@ bot.action(/action:refresh:(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const protocol = ctx.match[1];
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await refreshMarketsForUser(ctx, user, protocol);
 });
 
 bot.action("action:addwallet", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   user.ui.pending = { action: "addwallet" };
-  setUser(chatId, user);
+  await saveUi(chatId, user);
   await ctx.reply("Send wallet address to add (or several, one per line)");
 });
 
 bot.action(/wallet:open:(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   const index = Number(ctx.match[1]);
   const wallet = user.ui.walletMenu?.[index];
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
   user.ui.currentWallet = wallet;
-  setUser(chatId, user);
+  await saveUi(chatId, user);
   await ctx.editMessageText(formatWalletSettings(user, wallet), {
     parse_mode: "Markdown",
     ...walletSettingsMenu(user, wallet)
@@ -738,42 +745,42 @@ bot.action(/wallet:open:(\d+)/, async (ctx) => {
 bot.action(/wallet:remove:(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  let user = ensureUser(chatId);
+  let user = await ensureUser(chatId);
   const index = Number(ctx.match[1]);
   const wallet = user.ui.walletMenu?.[index];
   if (!wallet) {
     return ctx.reply("Wallet not found");
   }
-  removeWallet(ctx, wallet);
-  user = ensureUser(chatId);
+  await removeWallet(ctx, wallet);
+  user = await ensureUser(chatId);
   await ctx.editMessageText("Wallets", walletMenu(user));
-  setUser(chatId, user);
+  await saveUi(chatId, user);
 });
 
 bot.action(/wallet:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   const field = ctx.match[1];
   const wallet = user.ui.currentWallet;
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
   user.ui.pending = { action: "setwallet", field, wallet };
-  setUser(chatId, user);
+  await saveUi(chatId, user);
   await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} for ${formatWalletLabel(wallet)}`);
 });
 
 bot.action("wallet:reset", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   const wallet = user.ui.currentWallet;
   if (!wallet || !user.wallets[wallet]) {
     return ctx.reply("Wallet not found");
   }
+  await resetWalletThresholds(chatId, wallet);
   user.wallets[wallet].settings = {};
-  setUser(chatId, user);
   await ctx.editMessageText(formatWalletSettings(user, wallet), {
     parse_mode: "Markdown",
     ...walletSettingsMenu(user, wallet)
@@ -783,18 +790,18 @@ bot.action("wallet:reset", async (ctx) => {
 bot.action("wallet:back", async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   await ctx.editMessageText("Wallets", walletMenu(user));
-  setUser(chatId, user);
+  await saveUi(chatId, user);
 });
 
 bot.action(/def:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   const field = ctx.match[1];
   user.ui.pending = { action: "setdefault", field };
-  setUser(chatId, user);
+  await saveUi(chatId, user);
   await ctx.reply(`Send ${THRESHOLD_FIELDS[field].label} (global default)`);
 });
 
@@ -802,12 +809,12 @@ bot.on("text", async (ctx, next) => {
   const text = ctx.message.text;
   if (text.startsWith("/")) return next();
   const chatId = String(ctx.chat.id);
-  const user = ensureUser(chatId);
+  const user = await ensureUser(chatId);
   const pending = user.ui?.pending;
 
   if (pending?.action === "addwallet") {
     user.ui.pending = null;
-    setUser(chatId, user);
+    await saveUi(chatId, user);
     return addWallets(ctx, text);
   }
 
@@ -816,7 +823,7 @@ bot.on("text", async (ctx, next) => {
     const field = THRESHOLD_FIELDS[pending.field];
     if (!field) {
       user.ui.pending = null;
-      setUser(chatId, user);
+      await saveUi(chatId, user);
       return ctx.reply("Unknown setting");
     }
     if (!Number.isFinite(value) || value <= 0) {
@@ -824,22 +831,19 @@ bot.on("text", async (ctx, next) => {
     }
 
     user.ui.pending = null;
+    await saveUi(chatId, user);
 
     if (pending.action === "setdefault") {
-      user.settings[field.key] = value;
-      setUser(chatId, user);
+      await setGlobalThreshold(chatId, field.key, value);
       logger.info({ chatId, field: field.key, value }, "Global default set");
       return ctx.reply(`Default ${field.label} set to ${formatThresholdValue(field, value)}`);
     }
 
     const wallet = pending.wallet;
     if (!wallet || !user.wallets[wallet]) {
-      setUser(chatId, user);
       return ctx.reply("Wallet not found");
     }
-    if (!user.wallets[wallet].settings) user.wallets[wallet].settings = {};
-    user.wallets[wallet].settings[field.key] = value;
-    setUser(chatId, user);
+    await setWalletThreshold(chatId, wallet, field.key, value);
     logger.info({ chatId, wallet, field: field.key, value }, "Wallet threshold set");
     return ctx.reply(`${field.label} for ${formatWalletLabel(wallet)} set to ${formatThresholdValue(field, value)}`);
   }
@@ -925,17 +929,19 @@ async function checkPoolsForWallet(chatId, wallet, walletData) {
       if (!protocols[pool.platform]) protocols[pool.platform] = [];
       protocols[pool.platform].push(formatPoolPosition(pool, true));
     }
-    // Send BEFORE persisting the new state: if sending fails, the old state
-    // is kept and the transition fires again on the next cycle.
+    // Send BEFORE persisting the new state: if sending fails (throws), the old
+    // state is kept and the transition fires again on the next cycle.
     await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
   }
 
-  walletData.poolStates = next;
+  if (JSON.stringify(next) !== JSON.stringify(previous)) {
+    await setWalletPoolStates(chatId, wallet, next);
+  }
 }
 
 async function checkAllUsers() {
   try {
-    for (const [chatId, user] of getAllUsers()) {
+    for (const [chatId, user] of await getAllUsers()) {
       logger.info({ chatId }, "Checking user positions on background");
 
       if (!user.wallets) continue;
@@ -954,8 +960,6 @@ async function checkAllUsers() {
           logger.error({ chatId, wallet, error: error.message }, "Pool check failed");
         }
       }
-
-      setUser(chatId, user);
     }
   } catch (error) {
     logger.error({ error: error.message }, "Background check cycle failed");
@@ -973,7 +977,7 @@ async function checkTronForWallet(chatId, wallet, walletData) {
   const prev = walletData.tronState;
 
   if (!prev) {
-    walletData.tronState = flags;
+    await setWalletTronState(chatId, wallet, flags);
     logger.info({ chatId, wallet, flags }, "Tron baseline recorded");
     return;
   }
@@ -989,28 +993,27 @@ async function checkTronForWallet(chatId, wallet, walletData) {
   if (notes.length > 0) {
     logger.info({ chatId, wallet, notes }, "Tron transition");
     const body = `\`${wallet}\`\n\n*TRON*\n${notes.join("\n")}\n\n${formatTronResources(res)}`;
-    // Send before persisting: a failed send keeps the old state so it retries.
+    // Send before persisting: a failed send (throws) keeps the old state so it retries.
     await bot.telegram.sendMessage(chatId, body, { parse_mode: "Markdown" });
   }
 
-  walletData.tronState = flags;
+  if (prev.reclaim !== flags.reclaim || prev.delegate !== flags.delegate) {
+    await setWalletTronState(chatId, wallet, flags);
+  }
 }
 
 async function checkAllTron() {
   try {
-    for (const [chatId, user] of getAllUsers()) {
+    for (const [chatId, user] of await getAllUsers()) {
       if (!user.wallets) continue;
-      let touched = false;
       for (const [wallet, walletData] of Object.entries(user.wallets)) {
         if ((walletData.protocol || "") !== "tron") continue;
         try {
           await checkTronForWallet(chatId, wallet, walletData);
-          touched = true;
         } catch (error) {
           logger.error({ chatId, wallet, error: error.message }, "Tron check failed");
         }
       }
-      if (touched) setUser(chatId, user);
     }
   } catch (error) {
     logger.error({ error: error.message }, "Tron check cycle failed");
@@ -1018,6 +1021,8 @@ async function checkAllTron() {
 }
 
 async function init() {
+  await initDb();
+
   try {
     await fetchMarkets();
     await fetchAaveMarketsAll();
@@ -1040,7 +1045,7 @@ async function init() {
     logger.error({ error: error.message }, "Failed to set bot commands");
   }
 
-  const userCount = getUserCount();
+  const userCount = await getUserCount();
   if (userCount > 0) {
     logger.info({ count: userCount }, "Users loaded");
     setTimeout(checkAllUsers, 5000);
@@ -1053,15 +1058,19 @@ async function init() {
 
 init();
 
-process.once("SIGINT", () => {
-  logger.info("Shutting down (SIGINT)");
-  bot.stop("SIGINT");
-});
+async function shutdown(signal) {
+  logger.info(`Shutting down (${signal})`);
+  bot.stop(signal);
+  try {
+    await closeDb();
+  } catch (error) {
+    logger.error({ error: error.message }, "Error closing DB pool");
+  }
+  process.exit(0);
+}
 
-process.once("SIGTERM", () => {
-  logger.info("Shutting down (SIGTERM)");
-  bot.stop("SIGTERM");
-});
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 function formatBorrowRates(position) {
   const borrows = Array.isArray(position.borrows)

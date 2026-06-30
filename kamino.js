@@ -1,5 +1,7 @@
 import { logger } from "./logger.js";
-import { getMarkets as getMarketsFromDb, setMarkets } from "./db.js";
+import { marketsCache } from "./cache.js";
+
+const MARKETS_KEY = "kamino";
 
 const KAMINO_API = "https://api.kamino.finance";
 const NULL_PUBKEY = "11111111111111111111111111111111";
@@ -14,14 +16,14 @@ export async function fetchMarkets() {
   }
   
   const markets = await response.json();
-  setMarkets(markets);
-  
+  await marketsCache.set(MARKETS_KEY, markets);
+
   logger.info({ count: markets.length }, "Markets loaded and saved");
   return markets;
 }
 
-export function getCachedMarkets() {
-  return getMarketsFromDb();
+export async function getCachedMarkets() {
+  return marketsCache.get(MARKETS_KEY);
 }
 
 export async function getObligations(marketPubkey, walletAddress) {
@@ -104,14 +106,14 @@ function parseObligation(obl, marketName, borrowApyByReserve) {
 }
 
 export async function scanAllMarketsForWallet(walletAddress, marketCheckCallback) {
-  const markets = getCachedMarkets();
-  
+  const markets = await getCachedMarkets();
+
   if (!markets || markets.length === 0) {
     throw new Error("Markets not loaded");
   }
-  
+
   const results = [];
-  
+
   let index = 0;
   for (const market of markets) {
     try {
@@ -138,8 +140,8 @@ export async function scanAllMarketsForWallet(walletAddress, marketCheckCallback
 }
 
 export async function checkSpecificMarkets(walletAddress, marketNames) {
-  const allMarkets = getCachedMarkets();
-  
+  const allMarkets = await getCachedMarkets();
+
   if (!allMarkets || allMarkets.length === 0) {
     throw new Error("Markets not loaded");
   }

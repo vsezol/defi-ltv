@@ -15,6 +15,8 @@
     "@bgd-labs/aave-address-book": "^4.41.4",
     "@ethersproject/signing-key": "^5.8.0",
     "ethers": "^5.8.0",
+    "keyv": "^5.2.3",
+    "pg": "^8.13.1",
     "pino": "^10.1.0",
     "telegraf": "^4.16.3"
   },

@@ -1,0 +1,16 @@
+# Local Postgres for development. Production uses Railway's managed Postgres.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - defi-ltv-pgdata:/var/lib/postgresql/data
+
+volumes:
+  defi-ltv-pgdata:

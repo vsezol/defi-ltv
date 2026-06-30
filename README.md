@@ -39,8 +39,10 @@ Telegram bot that monitors your DeFi positions:
   NFTs + Orca public API, Uniswap V3 via the NonfungiblePositionManager contract
   on each chain.
 
-It's a single Node.js process — no Docker, no database. State lives in local JSON
-files (`db-kamino.json`, `db-aave.json`), created on first run.
+Durable state (users, wallets, per-wallet settings) lives in **PostgreSQL**.
+Refetchable/ephemeral state (market caches, transient UI state) lives in a
+swappable **keyv** cache — in-memory by default, Redis-ready via `REDIS_URL`.
+The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 
 ## Structure
 
@@ -53,28 +55,41 @@ files (`db-kamino.json`, `db-aave.json`), created on first run.
 | `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
 | `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by 30d-volume/TVL across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
-| `db.js` | File-based storage for users, wallets, settings and market cache. |
+| `db.js` | PostgreSQL (`pg`): users + wallets, granular atomic per-row ops; schema bootstrap. |
+| `cache.js` | keyv wrapper for ephemeral cache (markets, UI state); in-memory or Redis. |
 | `logger.js` | Logging (pino; pretty output in dev). |
 
 ## Requirements
 
 - Node.js **>= 20**
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- PostgreSQL (locally via the bundled `docker-compose.yml`)
 
 ## Run
 
 ```bash
+docker compose up -d   # local Postgres on :5432 (matches the default DATABASE_URL)
 npm install
 cp .env.example .env   # then put your BOT_TOKEN in .env
 npm run dev            # loads .env automatically (--env-file=.env)
 # or: npm start        # env vars must already be set
 ```
 
+## Deploy (Railway)
+
+1. Project → **New → Database → Add PostgreSQL**.
+2. Bot service → **Variables** → `DATABASE_URL = ${{Postgres.DATABASE_URL}}`
+   (reference var → resolves to the internal `*.railway.internal` host: no egress, no SSL).
+3. Redeploy. `npm start` runs the bot; tables are created on first boot.
+4. (Optional Redis cache: add a Redis service, set `REDIS_URL = ${{Redis.REDIS_URL}}`, `npm i @keyv/redis`.)
+
 ## Environment
 
 | Variable | Required | Description |
 | :--- | :--- | :--- |
 | `BOT_TOKEN` | yes | Telegram bot token from @BotFather. |
+| `DATABASE_URL` | yes | PostgreSQL connection string. Local dev: `postgres://postgres:dev@localhost:5432/postgres` (docker-compose). |
+| `REDIS_URL` | no | Redis URL for the ephemeral cache. Unset → in-memory. Requires `@keyv/redis`. |
 | `NODE_ENV` | no | `production` → plain JSON logs; anything else → pretty dev logs. |
 | `SOLANA_RPC_URL` | no | Solana RPC URL(s) for Orca scanning (comma-separated). Many public RPCs now block `getTokenAccountsByOwner`; set a private endpoint for reliable Orca monitoring. Falls back to keyless public RPCs. |
 

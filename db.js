@@ -1,203 +1,221 @@
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import pg from "pg";
 import { logger } from "./logger.js";
 
-const KAMINO_DB_FILE = "./db-kamino.json";
-const AAVE_DB_FILE = "./db-aave.json";
-const LEGACY_DB_FILE = "./db.json";
+const { Pool } = pg;
 
-const defaultKaminoDb = {
-  markets: [],
-  marketsUpdatedAt: null,
-  users: {}
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  logger.error("DATABASE_URL not set");
+  process.exit(1);
+}
+
+// Railway's internal network (and localhost) don't use TLS; the public proxy does.
+// node-postgres ignores ?sslmode in the URL, so set ssl explicitly.
+const needsSsl = !/railway\.internal|localhost|127\.0\.0\.1/.test(connectionString);
+
+const pool = new Pool({
+  connectionString,
+  max: 8,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  ssl: needsSsl ? { rejectUnauthorized: false } : false
+});
+
+// An idle client error must never crash the process.
+pool.on("error", (error) => logger.error({ error: error.message }, "Idle DB client error"));
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Threshold field (code) -> column (SQL). Whitelist: never interpolate raw field names.
+const THRESHOLD_COLUMNS = {
+  warningHealthFactor: "warning_hf",
+  dangerHealthFactor: "danger_hf",
+  warningBorrowRate: "warning_rate",
+  dangerBorrowRate: "danger_rate"
 };
 
-const defaultAaveDb = {
-  aaveMarkets: {},
-  aaveMarketsUpdatedAt: {},
-  users: {}
-};
+const DDL = `
+  CREATE TABLE IF NOT EXISTS users (
+    chat_id      TEXT PRIMARY KEY,
+    warning_hf   DOUBLE PRECISION,
+    danger_hf    DOUBLE PRECISION,
+    warning_rate DOUBLE PRECISION,
+    danger_rate  DOUBLE PRECISION,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE TABLE IF NOT EXISTS wallets (
+    chat_id      TEXT NOT NULL REFERENCES users(chat_id) ON DELETE CASCADE,
+    address      TEXT NOT NULL,
+    protocol     TEXT NOT NULL,
+    warning_hf   DOUBLE PRECISION,
+    danger_hf    DOUBLE PRECISION,
+    warning_rate DOUBLE PRECISION,
+    danger_rate  DOUBLE PRECISION,
+    markets      JSONB NOT NULL DEFAULT '[]',
+    pool_states  JSONB NOT NULL DEFAULT '{}',
+    tron_state   JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, address)
+  );
+`;
 
-let kaminoDb = null;
-let aaveDb = null;
-
-function loadJson(file, fallback) {
-  if (!existsSync(file)) return { ...fallback };
-  try {
-    return JSON.parse(readFileSync(file, "utf-8"));
-  } catch (error) {
-    logger.error({ file, error: error.message }, "Failed to load db");
-    return { ...fallback };
-  }
-}
-
-function saveJson(file, data) {
-  writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-export function loadDb() {
-  if (kaminoDb && aaveDb) return { kaminoDb, aaveDb };
-
-  const hasKamino = existsSync(KAMINO_DB_FILE);
-  const hasAave = existsSync(AAVE_DB_FILE);
-  const hasLegacy = existsSync(LEGACY_DB_FILE);
-
-  if (!hasKamino && hasLegacy) {
-    const legacy = loadJson(LEGACY_DB_FILE, defaultKaminoDb);
-    kaminoDb = {
-      markets: legacy.markets || [],
-      marketsUpdatedAt: legacy.marketsUpdatedAt || null,
-      users: legacy.users || {}
-    };
-  } else {
-    kaminoDb = loadJson(KAMINO_DB_FILE, defaultKaminoDb);
-  }
-
-  if (hasAave) {
-    aaveDb = loadJson(AAVE_DB_FILE, defaultAaveDb);
-  } else {
-    aaveDb = { ...defaultAaveDb };
-  }
-
-  return { kaminoDb, aaveDb };
-}
-
-function ensureLoaded() {
-  if (!kaminoDb || !aaveDb) loadDb();
-}
-
-function saveKamino() {
-  if (!kaminoDb) return;
-  saveJson(KAMINO_DB_FILE, kaminoDb);
-}
-
-function saveAave() {
-  if (!aaveDb) return;
-  saveJson(AAVE_DB_FILE, aaveDb);
-}
-
-export function getDb() {
-  ensureLoaded();
-  return { kaminoDb, aaveDb };
-}
-
-export function getMarkets() {
-  ensureLoaded();
-  return kaminoDb.markets;
-}
-
-export function setMarkets(markets) {
-  ensureLoaded();
-  kaminoDb.markets = markets;
-  kaminoDb.marketsUpdatedAt = new Date().toISOString();
-  saveKamino();
-}
-
-export function getAaveMarkets(networkKey) {
-  ensureLoaded();
-  return aaveDb.aaveMarkets[networkKey] || [];
-}
-
-export function setAaveMarkets(networkKey, markets) {
-  ensureLoaded();
-  aaveDb.aaveMarkets[networkKey] = markets;
-  aaveDb.aaveMarketsUpdatedAt[networkKey] = new Date().toISOString();
-  saveAave();
-}
-
-function mergeUsers(kaminoUser, aaveUser) {
-  if (!kaminoUser && !aaveUser) return undefined;
-  return {
-    wallets: {
-      ...(kaminoUser?.wallets || {}),
-      ...(aaveUser?.wallets || {})
-    },
-    // Global default thresholds are user-wide; persisted in the Kamino store.
-    settings: kaminoUser?.settings || {},
-    ui: kaminoUser?.ui || {}
-  };
-}
-
-function splitUser(user) {
-  const wallets = user?.wallets || {};
-  const kaminoWallets = {};
-  const aaveWallets = {};
-
-  for (const [wallet, data] of Object.entries(wallets)) {
-    const protocol = data?.protocol === "aave" ? "aave" : "kamino";
-    if (protocol === "aave") {
-      aaveWallets[wallet] = data;
-    } else {
-      kaminoWallets[wallet] = data;
+export async function initDb() {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await pool.query("SELECT 1");
+      await pool.query(DDL);
+      logger.info("Database ready");
+      return;
+    } catch (error) {
+      lastError = error;
+      logger.warn({ attempt: attempt + 1, error: error.message }, "DB init failed, retrying");
+      await sleep(2000 * (attempt + 1));
     }
   }
-
-  const kaminoUser = {
-    wallets: kaminoWallets,
-    settings: user?.settings || {},
-    ui: user?.ui || {}
-  };
-
-  const aaveUser = {
-    wallets: aaveWallets
-  };
-
-  return { kaminoUser, aaveUser };
+  logger.error({ error: lastError?.message }, "DB init failed permanently");
+  process.exit(1);
 }
 
-export function getUser(chatId) {
-  ensureLoaded();
-  const kaminoUser = kaminoDb.users[chatId];
-  const aaveUser = aaveDb.users[chatId];
-  return mergeUsers(kaminoUser, aaveUser);
+export async function closeDb() {
+  await pool.end();
 }
 
-export function setUser(chatId, user) {
-  ensureLoaded();
-  const { kaminoUser, aaveUser } = splitUser(user);
+// --- assembly: rows -> the merged user object shape the bot expects ---
 
-  const hasKaminoData =
-    Object.keys(kaminoUser.wallets).length > 0 ||
-    Object.keys(kaminoUser.settings || {}).length > 0 ||
-    Object.keys(kaminoUser.ui || {}).length > 0;
-  if (hasKaminoData) {
-    kaminoDb.users[chatId] = kaminoUser;
-  } else {
-    delete kaminoDb.users[chatId];
+function settingsFromRow(row) {
+  const settings = {};
+  if (row.warning_hf != null) settings.warningHealthFactor = row.warning_hf;
+  if (row.danger_hf != null) settings.dangerHealthFactor = row.danger_hf;
+  if (row.warning_rate != null) settings.warningBorrowRate = row.warning_rate;
+  if (row.danger_rate != null) settings.dangerBorrowRate = row.danger_rate;
+  return settings;
+}
+
+function assembleUser(userRow, walletRows) {
+  const wallets = {};
+  for (const w of walletRows) {
+    wallets[w.address] = {
+      protocol: w.protocol,
+      markets: w.markets || [],
+      poolStates: w.pool_states || {},
+      settings: settingsFromRow(w),
+      ...(w.tron_state ? { tronState: w.tron_state } : {})
+    };
   }
+  return { wallets, settings: userRow ? settingsFromRow(userRow) : {} };
+}
 
-  const hasAaveData = Object.keys(aaveUser.wallets).length > 0;
-  if (hasAaveData) {
-    aaveDb.users[chatId] = aaveUser;
-  } else {
-    delete aaveDb.users[chatId];
+// --- reads ---
+
+export async function getUser(chatId) {
+  const [userRes, walletRes] = await Promise.all([
+    pool.query("SELECT * FROM users WHERE chat_id = $1", [chatId]),
+    pool.query("SELECT * FROM wallets WHERE chat_id = $1", [chatId])
+  ]);
+  if (userRes.rowCount === 0 && walletRes.rowCount === 0) return undefined;
+  return assembleUser(userRes.rows[0], walletRes.rows);
+}
+
+export async function getAllUsers() {
+  const [userRes, walletRes] = await Promise.all([
+    pool.query("SELECT * FROM users"),
+    pool.query("SELECT * FROM wallets ORDER BY chat_id")
+  ]);
+  const byChat = new Map();
+  for (const u of userRes.rows) byChat.set(u.chat_id, { userRow: u, walletRows: [] });
+  for (const w of walletRes.rows) {
+    if (!byChat.has(w.chat_id)) byChat.set(w.chat_id, { userRow: null, walletRows: [] });
+    byChat.get(w.chat_id).walletRows.push(w);
   }
-
-  saveKamino();
-  saveAave();
-}
-
-export function deleteUser(chatId) {
-  ensureLoaded();
-  delete kaminoDb.users[chatId];
-  delete aaveDb.users[chatId];
-  saveKamino();
-  saveAave();
-}
-
-export function getUserCount() {
-  ensureLoaded();
-  const ids = new Set([
-    ...Object.keys(kaminoDb.users || {}),
-    ...Object.keys(aaveDb.users || {})
+  return Array.from(byChat.entries()).map(([chatId, { userRow, walletRows }]) => [
+    chatId,
+    assembleUser(userRow, walletRows)
   ]);
-  return ids.size;
 }
 
-export function getAllUsers() {
-  ensureLoaded();
-  const ids = new Set([
-    ...Object.keys(kaminoDb.users || {}),
-    ...Object.keys(aaveDb.users || {})
+export async function getUserCount() {
+  const res = await pool.query("SELECT count(*)::int AS n FROM users");
+  return res.rows[0].n;
+}
+
+// --- writes (granular, atomic) ---
+
+export async function upsertWallet(chatId, address, { protocol, markets = [], poolStates = {}, tronState = null }) {
+  await pool.query("INSERT INTO users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING", [chatId]);
+  await pool.query(
+    `INSERT INTO wallets (chat_id, address, protocol, markets, pool_states, tron_state)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
+     ON CONFLICT (chat_id, address) DO UPDATE SET
+       protocol    = EXCLUDED.protocol,
+       markets     = EXCLUDED.markets,
+       pool_states = EXCLUDED.pool_states,
+       tron_state  = EXCLUDED.tron_state`,
+    [
+      chatId,
+      address,
+      protocol,
+      JSON.stringify(markets),
+      JSON.stringify(poolStates),
+      tronState ? JSON.stringify(tronState) : null
+    ]
+  );
+}
+
+export async function deleteWallet(chatId, address) {
+  await pool.query("DELETE FROM wallets WHERE chat_id = $1 AND address = $2", [chatId, address]);
+}
+
+export async function deleteUser(chatId) {
+  await pool.query("DELETE FROM users WHERE chat_id = $1", [chatId]);
+}
+
+export async function setGlobalThreshold(chatId, field, value) {
+  const col = THRESHOLD_COLUMNS[field];
+  if (!col) throw new Error(`Unknown threshold field: ${field}`);
+  await pool.query(
+    `INSERT INTO users (chat_id, ${col}) VALUES ($1, $2)
+     ON CONFLICT (chat_id) DO UPDATE SET ${col} = $2, updated_at = now()`,
+    [chatId, value]
+  );
+}
+
+export async function setWalletThreshold(chatId, address, field, value) {
+  const col = THRESHOLD_COLUMNS[field];
+  if (!col) throw new Error(`Unknown threshold field: ${field}`);
+  await pool.query(`UPDATE wallets SET ${col} = $3 WHERE chat_id = $1 AND address = $2`, [chatId, address, value]);
+}
+
+export async function resetWalletThresholds(chatId, address) {
+  await pool.query(
+    `UPDATE wallets SET warning_hf = NULL, danger_hf = NULL, warning_rate = NULL, danger_rate = NULL
+     WHERE chat_id = $1 AND address = $2`,
+    [chatId, address]
+  );
+}
+
+export async function setWalletMarkets(chatId, address, markets) {
+  await pool.query("UPDATE wallets SET markets = $3::jsonb WHERE chat_id = $1 AND address = $2", [
+    chatId,
+    address,
+    JSON.stringify(markets || [])
   ]);
-  return Array.from(ids).map((id) => [id, getUser(id)]);
+}
+
+// Column-scoped UPDATE (never upsert) — must not resurrect a wallet removed mid-scan.
+export async function setWalletPoolStates(chatId, address, states) {
+  await pool.query("UPDATE wallets SET pool_states = $3::jsonb WHERE chat_id = $1 AND address = $2", [
+    chatId,
+    address,
+    JSON.stringify(states || {})
+  ]);
+}
+
+export async function setWalletTronState(chatId, address, state) {
+  await pool.query("UPDATE wallets SET tron_state = $3::jsonb WHERE chat_id = $1 AND address = $2", [
+    chatId,
+    address,
+    JSON.stringify(state || {})
+  ]);
 }
