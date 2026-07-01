@@ -97,6 +97,11 @@ function buildCandidate(pool, chain) {
 
   const version = pool.protocolVersion === "V4" ? "v4" : "v3";
   const id = version === "v4" ? pool.poolId : pool.address;
+  // Fee rate as a decimal fraction (feeTier is in pips: 3000 = 0.30%). Dynamic-fee
+  // pools have an unknown rate → 0 (they sort last; we can't estimate their yield).
+  const feeRate = pool.feeTier === DYNAMIC_FEE_FLAG ? 0 : pool.feeTier / 1_000_000;
+  // Estimated 30d fee yield on capital: fees earned (vol * fee) per unit of TVL.
+  const feeYield30d = tvl > 0 ? (vol30d * feeRate) / tvl : -1;
   return {
     chain: chain.name,
     version,
@@ -105,7 +110,7 @@ function buildCandidate(pool, chain) {
     vol30d,
     symbol: `${a}/${b}`,
     category,
-    ratio: tvl > 0 ? vol30d / tvl : -1,
+    feeYield30d,
     url: id ? `https://app.uniswap.org/explore/pools/${chain.slug}/${id}` : null
   };
 }
@@ -125,10 +130,10 @@ async function fetchChainCandidates(chain) {
   }
 }
 
-function topByRatio(candidates, category) {
+function topByYield(candidates, category) {
   return candidates
     .filter((c) => c.category === category)
-    .sort((a, b) => b.ratio - a.ratio)
+    .sort((a, b) => b.feeYield30d - a.feeYield30d)
     .slice(0, DISPLAY_LIMIT);
 }
 
@@ -142,7 +147,7 @@ export async function getTopLpPools(options = {}) {
 
   return {
     chains,
-    btc: topByRatio(candidates, "btc"),
-    eth: topByRatio(candidates, "eth")
+    btc: topByYield(candidates, "btc"),
+    eth: topByYield(candidates, "eth")
   };
 }
