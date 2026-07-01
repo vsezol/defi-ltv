@@ -97,11 +97,14 @@ function buildCandidate(pool, chain) {
 
   const version = pool.protocolVersion === "V4" ? "v4" : "v3";
   const id = version === "v4" ? pool.poolId : pool.address;
-  // Fee rate as a decimal fraction (feeTier is in pips: 3000 = 0.30%). Dynamic-fee
-  // pools have an unknown rate → 0 (they sort last; we can't estimate their yield).
-  const feeRate = pool.feeTier === DYNAMIC_FEE_FLAG ? 0 : pool.feeTier / 1_000_000;
-  // Estimated 30d fee yield on capital: fees earned (vol * fee) per unit of TVL.
-  const feeYield30d = tvl > 0 ? (vol30d * feeRate) / tvl : -1;
+  // Fee percent (feeTier is in pips: 3000 = 0.30%). Dynamic-fee pools have an
+  // unknown rate → 0 (they sort last; can't estimate their fee income).
+  const feePct = pool.feeTier === DYNAMIC_FEE_FLAG ? 0 : pool.feeTier / 10000;
+  // Relative profitability score = (30d volume / TVL) * fee %. Weights capital
+  // efficiency by the fee tier (fee income per unit of pool liquidity). It's an
+  // abstract comparison number, NOT a yield % — the real return depends on how
+  // narrow the LP range is, which we can't know.
+  const score = tvl > 0 ? (vol30d / tvl) * feePct : -1;
   return {
     chain: chain.name,
     version,
@@ -110,7 +113,7 @@ function buildCandidate(pool, chain) {
     vol30d,
     symbol: `${a}/${b}`,
     category,
-    feeYield30d,
+    score,
     url: id ? `https://app.uniswap.org/explore/pools/${chain.slug}/${id}` : null
   };
 }
@@ -130,10 +133,10 @@ async function fetchChainCandidates(chain) {
   }
 }
 
-function topByYield(candidates, category) {
+function topByScore(candidates, category) {
   return candidates
     .filter((c) => c.category === category)
-    .sort((a, b) => b.feeYield30d - a.feeYield30d)
+    .sort((a, b) => b.score - a.score)
     .slice(0, DISPLAY_LIMIT);
 }
 
@@ -147,7 +150,7 @@ export async function getTopLpPools(options = {}) {
 
   return {
     chains,
-    btc: topByYield(candidates, "btc"),
-    eth: topByYield(candidates, "eth")
+    btc: topByScore(candidates, "btc"),
+    eth: topByScore(candidates, "eth")
   };
 }

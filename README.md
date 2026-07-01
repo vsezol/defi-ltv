@@ -12,7 +12,7 @@ Telegram bot that monitors your DeFi positions:
   their reclaim dates, alerting when delegated resources become reclaimable or
   when free resources can be (re)delegated.
 - **Top LP discovery** (`/toplp`, `/toplpl2`) — ranks Uniswap v3/v4 BTC and ETH
-  pools **paired with USDC/USDT** across the top-5 EVM chains by **30d fee yield** (vol × fee ÷ TVL)
+  pools **paired with USDC/USDT** across the top-5 EVM chains by a **fee-weighted score** (30d vol / TVL × fee%)
   (capital efficiency), liquidity > $100k. Two lists (BTC, ETH), top 10 each, with
   direct Uniswap links. `/toplpl2` excludes Ethereum L1 (lower-gas chains only).
 
@@ -54,7 +54,7 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 | `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
 | `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
-| `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by 30d fee yield (vol×fee/TVL) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
+| `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by a fee-weighted score (30d vol/TVL × fee%) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
 | `db.js` | PostgreSQL (`pg`): users + wallets, granular atomic per-row ops; schema bootstrap. |
 | `cache.js` | keyv wrapper for ephemeral cache (markets, UI state); in-memory or Redis. |
 | `logger.js` | Logging (pino; pretty output in dev). |
@@ -101,5 +101,5 @@ Everything is driven through the interactive menu:
   edit its thresholds, **Settings** edits the global defaults, **Check All** /
   **Refresh All** run checks, **Top LP** / **Top LP (L2)** rank pools.
 - `/checkall` — check all positions now (lending + LP pools + Tron).
-- `/toplp` — top Uniswap v3/v4 BTC/ETH-vs-stable pools by 30d fee yield (vol×fee/TVL).
+- `/toplp` — top Uniswap v3/v4 BTC/ETH-vs-stable pools by fee-weighted score (30d vol/TVL × fee%).
 - `/toplpl2` — same, excluding Ethereum L1 (lower-gas chains only).

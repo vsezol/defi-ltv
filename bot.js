@@ -210,10 +210,10 @@ function fmtUsd(n) {
 
 function formatLpPool(c, i) {
   const name = c.url ? `[${c.symbol}](${c.url})` : c.symbol;
-  const yieldVal = c.feeYield30d >= 0 ? `${(c.feeYield30d * 100).toFixed(2)}%` : "?";
+  const scoreVal = c.score >= 0 ? c.score.toFixed(2) : "?";
   return (
     `${i + 1}. ${name}  ${c.feeLabel} ${c.version} · ${c.chain}\n` +
-    `fee yield *${yieldVal}*/30d · 30d ${fmtUsd(c.vol30d)} · TVL ${fmtUsd(c.tvl)}`
+    `score *${scoreVal}* · 30d ${fmtUsd(c.vol30d)} · TVL ${fmtUsd(c.tvl)}`
   );
 }
 
@@ -226,7 +226,7 @@ function formatLpList(pools) {
 function formatTopLpMessages(result, title) {
   const chainsList = result.chains.map((c, i) => `${i + 1}. ${c.name} — ${fmtUsd(c.tvl)}`).join("\n");
   return [
-    `*${title} — 30d fee yield (vol×fee/TVL)*\n\nTop chains by TVL:\n${chainsList}`,
+    `*${title} — score = 30d vol / TVL × fee%*\n\nTop chains by TVL:\n${chainsList}`,
     `*BTC / stablecoin*\n\n${formatLpList(result.btc)}`,
     `*ETH / stablecoin*\n\n${formatLpList(result.eth)}`
   ];
@@ -621,7 +621,7 @@ bot.start((ctx) => {
     "Send wallet address(es) — one per line — to start monitoring them.\n\n" +
     "/menu - open menu (wallets, thresholds, checks)\n" +
     "/checkall - check all positions (lending + pools + Tron)\n" +
-    "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 30d fee yield\n" +
+    "/toplp - top Uniswap LP pools (BTC/ETH vs stables) by 30d fee-weighted score\n" +
     "/toplpl2 - same, excluding Ethereum L1 (lower gas chains only)"
   );
 });
@@ -1019,7 +1019,7 @@ async function init() {
     await bot.telegram.setMyCommands([
       { command: "menu", description: "Open menu" },
       { command: "checkall", description: "Check all positions (lending + pools + Tron)" },
-      { command: "toplp", description: "Top Uniswap LP pools (BTC/ETH vs stables) by 30d fee yield" },
+      { command: "toplp", description: "Top Uniswap LP pools (BTC/ETH vs stables) by 30d vol/TVL x fee" },
       { command: "toplpl2", description: "Top LP excluding Ethereum L1 (L2/sidechains only)" }
     ]);
   } catch (error) {
