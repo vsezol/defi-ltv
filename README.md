@@ -21,9 +21,28 @@ Telegram bot that monitors your DeFi positions:
   pools **paired with USDC/USDT** across the top-5 EVM chains by a **fee-weighted score** (30d vol / TVL × fee%)
   (capital efficiency), liquidity > $100k. Two lists (BTC, ETH), top 10 each, with
   direct Uniswap links. `/toplpl2` excludes Ethereum L1 (lower-gas chains only).
-- **Telegram Mini App** — a React web app (served by the bot process) for
-  managing wallets, thresholds and viewing positions; notifications stay in the
-  bot chat. Auto dark/light theme following Telegram.
+- **Web app** — a React app for managing wallets, thresholds and viewing
+  positions. Works both as a **Telegram Mini App** and **standalone in a
+  browser** (sign-in via the Telegram Login Widget). Notifications stay in the
+  bot chat. Auto dark/light theme.
+
+## Architecture
+
+Two services:
+
+- **Core (monolith, repo root, plain JS)** — owns PostgreSQL, all chain
+  scanners, the background alert loops and the REST API (`/api/*`); also serves
+  the web app bundle. The only service that touches the database.
+- **Bot (`bot/`, TypeScript strict)** — a thin UI layer over the core API: it
+  renders Telegram menus/messages and forwards every command to the core via
+  HTTP (`Authorization: Internal <token>` + `X-Chat-Id`). It exposes one
+  endpoint of its own, `POST /notify`, which the core calls to deliver alert
+  events; the bot renders them into Telegram messages. If delivery fails, the
+  core keeps the previous alert state and retries next cycle.
+
+Web app auth: inside Telegram — signed `initData` (`tma` header); standalone —
+Telegram Login Widget → the core validates the widget signature and issues a
+30-day JWT (`Bearer` header).
 
 ## How it works
 
@@ -59,8 +78,12 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 
 | File | Purpose |
 | :--- | :--- |
-| `bot.js` | Entry point: Telegram bot, commands, menu, background check loop. |
-| `core.js` | Shared logic (bot + Mini App API): wallet type detection, thresholds/defaults, pool & supply scan dispatchers, add-wallet flow. |
+| `main.js` | Core entry point: DB init, market caches, alert loops, web server. |
+| `server.js` | Express: REST API (`/api/*`, three auth modes) + static webapp bundle. |
+| `alerts.js` | Background alert loops (lending, supply APY, LP range, Tron) emitting structured events to the bot. |
+| `notifier.js` | Delivers alert events to the bot's `/notify` (throws on failure → alert state kept, retried). |
+| `auth.js` | Telegram initData + Login Widget validation, session JWTs, internal-token check. |
+| `core.js` | Shared domain logic: wallet type detection, thresholds/defaults, severity, scan dispatchers, add-wallet & refresh flows. |
 | `kamino.js` | Kamino lending positions + Kamino Earn (kVault) deposits via `https://api.kamino.finance`. |
 | `aave.js` | Aave V3 borrow + supply positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), with multi-RPC fallback. |
 | `fluid.js` | Fluid (Instadapp) lending deposits via `api.fluid.instadapp.io` (fToken positions + supply APR). |
@@ -69,10 +92,9 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
 | `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by a fee-weighted score (30d vol/TVL × fee%) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
 | `db.js` | PostgreSQL (`pg`): users + wallets, granular atomic per-row ops; schema bootstrap. |
-| `cache.js` | keyv wrapper for ephemeral cache (markets, UI state); in-memory or Redis. |
-| `server.js` | Express: Mini App REST API (`/api/*`, initData-authenticated) + static webapp bundle. |
-| `webapp-auth.js` | Telegram initData HMAC validation (no deps). |
-| `webapp/` | Mini App frontend: React + `@telegram-apps/telegram-ui` + Vite. |
+| `cache.js` | keyv wrapper for ephemeral cache (markets); in-memory or Redis. |
+| `webapp/` | Web app frontend: React + `@telegram-apps/telegram-ui` + Vite. |
+| `bot/` | Telegram bot microservice (TypeScript strict): menus/commands over the core API + `/notify` renderer. |
 | `logger.js` | Logging (pino; pretty output in dev). |
 
 ## Requirements
@@ -86,47 +108,77 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 ```bash
 docker compose up -d   # local Postgres on :5432 (matches the default DATABASE_URL)
 npm install
-cp .env.example .env   # then put your BOT_TOKEN in .env
-npm run dev            # loads .env automatically (--env-file=.env)
-# or: npm start        # env vars must already be set
+cp .env.example .env   # put your BOT_TOKEN in .env (keep the dev INTERNAL_TOKEN)
+npm run dev            # core: API + alert loops on :3000
+
+# in a second terminal — the bot microservice:
+cd bot && npm install
+npm run build
+BOT_TOKEN=... CORE_URL=http://localhost:3000 INTERNAL_TOKEN=dev-internal-token npm start
+# (or `npm run dev` with the same env for tsx watch)
 ```
 
-## Deploy (Railway)
+## Deploy (Railway) — two services from one repo
 
 1. Project → **New → Database → Add PostgreSQL**.
-2. Bot service → **Variables** → `DATABASE_URL = ${{Postgres.DATABASE_URL}}`
-   (reference var → resolves to the internal `*.railway.internal` host: no egress, no SSL).
-3. Redeploy. `npm start` runs the bot; tables are created on first boot
-   (`npm run build` builds the Mini App bundle during deploy).
-4. **Mini App**: Settings → Networking → **Generate Domain**, then set
-   `WEBAPP_URL = https://<app>.up.railway.app`. On the next boot the bot points
-   its menu button at the app.
+2. **Core service** (root directory `/`):
+   - Variables: `BOT_TOKEN`, `DATABASE_URL = ${{Postgres.DATABASE_URL}}`,
+     `INTERNAL_TOKEN` (e.g. `openssl rand -hex 32`),
+     `BOT_URL = http://<bot-service-name>.railway.internal:3100`.
+   - Settings → Networking → **Generate Domain** (this is the web app URL).
+     When asked for a port, use the service's `PORT` (default 3000).
+   - Build runs `npm run build` (webapp bundle), start `npm start`.
+3. **Bot service** (add a second service from the same repo, **Root Directory
+   = `bot`**):
+   - Variables: `BOT_TOKEN` (same), `INTERNAL_TOKEN` (same),
+     `CORE_URL = http://<core-service-name>.railway.internal:3000`,
+     `PORT = 3100`, `WEBAPP_URL = https://<core domain>` (so the menu button
+     opens the app).
+   - Build `npm run build` (tsc), start `npm start`.
+4. **Login Widget** (standalone browser sign-in): in BotFather run
+   `/setdomain` for your bot and set it to the core domain — the widget only
+   renders on the registered domain.
 5. (Optional Redis cache: add a Redis service, set `REDIS_URL = ${{Redis.REDIS_URL}}`, `npm i @keyv/redis`.)
 
-## Mini App
+## Web app
 
-- Open it from the bot's **menu button** (set automatically when `WEBAPP_URL` is configured).
+- **Inside Telegram**: opens from the bot's menu button (set automatically when
+  the bot service has `WEBAPP_URL`), auth via signed `initData` — no login step.
+- **Standalone browser**: open the core domain directly → sign in with the
+  Telegram Login Widget → the core issues a 30-day JWT. Same account, same data.
 - Three tabs: **Positions** (on-demand scan of everything: deposits, lending,
   LP pools, Tron — with totals), **Wallets** (add one or many, remove),
-  **Settings** (global defaults + per-wallet threshold overrides).
-- Auth: every `/api` request carries Telegram's signed `initData`; the server
-  validates the HMAC with the bot token — no separate accounts.
-- Local dev: `npm run dev` (bot + API on :3000), `cd webapp && npx vite` (UI on
-  :5173 with `/api` proxied). To open inside Telegram it must be HTTPS — tunnel
-  with `cloudflared tunnel --url http://localhost:5173` and point a dev bot's
-  menu button at the tunnel URL.
+  **Settings** (global defaults + per-wallet threshold overrides; standalone
+  mode also has Log out).
+- Local dev: core on :3000, `cd webapp && npx vite` (UI on :5173 with `/api`
+  proxied). To open inside Telegram it must be HTTPS — tunnel with
+  `cloudflared tunnel --url http://localhost:5173` and point a dev bot's menu
+  button at the tunnel URL.
 
 ## Environment
+
+Core service (repo root):
+
+| Variable | Required | Description |
+| :--- | :--- | :--- |
+| `BOT_TOKEN` | yes | Telegram bot token — used to validate webapp auth signatures (initData / Login Widget). |
+| `DATABASE_URL` | yes | PostgreSQL connection string. Local dev: `postgres://postgres:dev@localhost:5432/postgres` (docker-compose). |
+| `INTERNAL_TOKEN` | yes | Shared secret for core ↔ bot HTTP auth (same value in both services). |
+| `BOT_URL` | yes* | Base URL of the bot microservice for alert delivery. Without it alerts can't be delivered (they retry every cycle). |
+| `PORT` | no | HTTP port for API + webapp (default 3000; Railway injects it). |
+| `REDIS_URL` | no | Redis URL for the ephemeral cache. Unset → in-memory. Requires `@keyv/redis`. |
+| `NODE_ENV` | no | `production` → plain JSON logs; anything else → pretty dev logs. |
+| `SOLANA_RPC_URL` | no | Solana RPC URL(s) for Orca scanning (comma-separated). Many public RPCs now block `getTokenAccountsByOwner`; set a private endpoint for reliable Orca monitoring. Falls back to keyless public RPCs. |
+
+Bot microservice (`bot/`):
 
 | Variable | Required | Description |
 | :--- | :--- | :--- |
 | `BOT_TOKEN` | yes | Telegram bot token from @BotFather. |
-| `DATABASE_URL` | yes | PostgreSQL connection string. Local dev: `postgres://postgres:dev@localhost:5432/postgres` (docker-compose). |
-| `REDIS_URL` | no | Redis URL for the ephemeral cache. Unset → in-memory. Requires `@keyv/redis`. |
-| `NODE_ENV` | no | `production` → plain JSON logs; anything else → pretty dev logs. |
-| `SOLANA_RPC_URL` | no | Solana RPC URL(s) for Orca scanning (comma-separated). Many public RPCs now block `getTokenAccountsByOwner`; set a private endpoint for reliable Orca monitoring. Falls back to keyless public RPCs. |
-| `WEBAPP_URL` | no | Public HTTPS URL of the Mini App. When set, the bot's menu button opens it. |
-| `PORT` | no | HTTP port for the Mini App server (default 3000; Railway injects it). |
+| `CORE_URL` | yes | Base URL of the core API. |
+| `INTERNAL_TOKEN` | yes | Shared secret (same as core). |
+| `PORT` | no | Port for the `/notify` listener (default 3100). |
+| `WEBAPP_URL` | no | Public HTTPS URL of the web app. When set, the bot's menu button opens it. |
 
 ## Bot commands
 

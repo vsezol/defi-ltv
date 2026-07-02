@@ -4,7 +4,7 @@ import { getFluidSuppliesForWallet } from "./fluid.js";
 import { getOrcaPositionsForWallet } from "./orca.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, computeTronFlags } from "./tron.js";
-import { getUser, upsertWallet } from "./db.js";
+import { getUser, upsertWallet, setWalletMarkets } from "./db.js";
 import { logger } from "./logger.js";
 
 // Shared between the Telegram bot (bot.js) and the Mini App API (server.js).
@@ -107,6 +107,51 @@ export async function scanSuppliesForWallet(wallet) {
 
 export function isSupplyBelow(position, threshold) {
   return Number.isFinite(position.supplyApy) && position.supplyApy < threshold;
+}
+
+// 0 = ok, 1 = warning, 2 = danger. Worst of the health-factor and borrow-rate checks.
+export function positionSeverity(thresholds, healthFactor, borrowRate) {
+  let level = 0;
+
+  const hf = parseFloat(healthFactor);
+  if (Number.isFinite(hf)) {
+    if (hf <= thresholds.dangerHealthFactor) level = Math.max(level, 2);
+    else if (hf <= thresholds.warningHealthFactor) level = Math.max(level, 1);
+  }
+
+  const br = parseFloat(borrowRate);
+  if (Number.isFinite(br)) {
+    if (br >= thresholds.dangerBorrowRate) level = Math.max(level, 2);
+    else if (br >= thresholds.warningBorrowRate) level = Math.max(level, 1);
+  }
+
+  return level;
+}
+
+// Rescan lending markets for a user's wallets and persist the market lists.
+// Returns per-wallet scan results (presentation is up to the caller).
+export async function refreshWalletsCore(chatId, protocolFilter) {
+  const user = (await getUser(chatId)) || {};
+  const wallets = Object.entries(user.wallets || {}).filter(([_, data]) => {
+    if ((data.protocol || "") === "tron") return false;
+    if (!protocolFilter || protocolFilter === "all") return true;
+    return (data.protocol || "kamino") === protocolFilter;
+  });
+
+  const results = [];
+  for (const [wallet, walletData] of wallets) {
+    const protocol = walletData.protocol || "kamino";
+    try {
+      const positions =
+        protocol === "aave" ? await scanAaveMarketsForWallet(wallet) : await scanAllMarketsForWallet(wallet);
+      await setWalletMarkets(chatId, wallet, (positions || []).map((p) => p.market));
+      results.push({ address: wallet, protocol, positions: positions || [] });
+    } catch (error) {
+      logger.error({ wallet, error: error.message }, "Refresh failed");
+      results.push({ address: wallet, protocol, positions: [], error: error.message });
+    }
+  }
+  return results;
 }
 
 // Scan a wallet and persist it. Returns what was found so the caller can render

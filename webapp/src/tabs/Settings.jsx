@@ -11,7 +11,7 @@ import {
   Snackbar,
   Spinner
 } from "@telegram-apps/telegram-ui";
-import { api } from "../api.js";
+import { api, clearToken, getAuthMode } from "../api.js";
 import { shortAddress } from "../format.js";
 
 const FIELDS = [
@@ -132,6 +132,9 @@ export default function Settings({ state, loading, error, onRefresh }) {
   const hasCurrentOverride =
     editor?.scope === "wallet" && selectedWallet?.thresholds?.[editor.fieldKey] != null;
 
+  // Only relevant for standalone-browser sessions (Bearer JWT); hidden inside Telegram.
+  const isTokenAuth = getAuthMode() === "token";
+
   return (
     <>
       {!selectedWallet ? (
@@ -180,6 +183,16 @@ export default function Settings({ state, loading, error, onRefresh }) {
               );
             })}
           </Section>
+          {isTokenAuth && (
+            <Section header="Account" footer="Signed in via Telegram Login.">
+              <Cell
+                style={{ color: "var(--tgui--destructive_text_color)" }}
+                onClick={() => clearToken()}
+              >
+                Log out
+              </Cell>
+            </Section>
+          )}
         </List>
       ) : (
         <List>

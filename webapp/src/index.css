@@ -4,6 +4,33 @@ body {
   background: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #fff));
 }
 
+/* standalone-browser login screen: centered placeholder */
+.login-screen {
+  min-height: 100vh;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tgui--secondary_bg_color);
+  padding: 24px 16px;
+}
+
+.login-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 320px;
+}
+
+/* container the Telegram Login Widget iframe is injected into */
+.login-widget-container {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* app container lives inside AppRoot, so tgui variables resolve here */
 .app-content {
   min-height: 100vh;

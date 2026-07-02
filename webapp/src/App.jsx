@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Tabbar } from "@telegram-apps/telegram-ui";
-import { api } from "./api.js";
+import { api, getAuthMode, onAuthChange } from "./api.js";
+import Login from "./Login.jsx";
 import Positions from "./tabs/Positions.jsx";
 import Wallets from "./tabs/Wallets.jsx";
 import Settings from "./tabs/Settings.jsx";
@@ -43,6 +44,19 @@ const TABS = [
 ];
 
 export default function App() {
+  const [authMode, setAuthMode] = useState(getAuthMode);
+
+  // Reacts to login (setToken), logout (clearToken) and 401-triggered clears.
+  useEffect(() => onAuthChange(setAuthMode), []);
+
+  if (authMode === "none") {
+    return <Login />;
+  }
+  // key remounts the app on auth mode change so data is fetched fresh after login
+  return <AuthedApp key={authMode} />;
+}
+
+function AuthedApp() {
   const [tab, setTab] = useState("positions");
   const [state, setState] = useState(null);
   const [stateLoading, setStateLoading] = useState(true);
