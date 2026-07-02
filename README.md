@@ -7,7 +7,9 @@ Telegram bot that monitors your DeFi positions:
   your Warning/Danger threshold.
 - **LP pools** — concentrated-liquidity positions on **Orca** (Solana) and
   **Uniswap V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a position
-  goes **out of range** or comes back **in range**.
+  goes **out of range** or comes back **in range**. Each position shows its
+  **deposited value and uncollected (pending) fees in USD**; `/checkall` adds a
+  total across all pools.
 - **Tron resources** — staked **energy/bandwidth**, outgoing delegations and
   their reclaim dates, alerting when delegated resources become reclaimable or
   when free resources can be (re)delegated.

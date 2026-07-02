@@ -185,6 +185,11 @@ function formatRangeCoord(position) {
   return ` ${coord > 1 ? "+" : ""}${coord.toFixed(2)}`;
 }
 
+function fmtUsdExact(n) {
+  if (!Number.isFinite(n)) return "?";
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function formatPoolPosition(position, transition) {
   const prefix = position.inRange ? "✅ " : "🔴 ";
   let status = position.inRange ? "IN RANGE" : "OUT OF RANGE";
@@ -197,7 +202,10 @@ function formatPoolPosition(position, transition) {
   const range = position.isFullRange
     ? "Full range"
     : `Range: ${formatPoolPrice(position.lowerPrice)} — ${formatPoolPrice(position.upperPrice)} ${position.priceLabel}`;
-  return `${prefix}${position.pool}:\nStatus: ${status}\n${range}`;
+  const money = Number.isFinite(position.valueUsd) || Number.isFinite(position.pendingFeesUsd)
+    ? `\nDeposited: ${fmtUsdExact(position.valueUsd)} · Fees: ${fmtUsdExact(position.pendingFeesUsd)}`
+    : "";
+  return `${prefix}${position.pool}:\nStatus: ${status}\n${range}${money}`;
 }
 
 function fmtUsd(n) {
@@ -523,6 +531,7 @@ async function checkWallets(ctx, user, protocolFilter) {
   }
   const statusMsg = await ctx.reply("Checking...");
   const grouped = new Map();
+  const lpTotals = { valueUsd: 0, feesUsd: 0, count: 0 };
   for (const [wallet, walletData] of wallets) {
     if (!grouped.has(wallet)) grouped.set(wallet, {});
     const protocol = walletData.protocol || "kamino";
@@ -561,6 +570,11 @@ async function checkWallets(ctx, user, protocolFilter) {
         if (pools.length > 0) {
           const platform = pools[0].platform;
           grouped.get(wallet)[platform] = pools.map(p => formatPoolPosition(p));
+          for (const pool of pools) {
+            lpTotals.count += 1;
+            if (Number.isFinite(pool.valueUsd)) lpTotals.valueUsd += pool.valueUsd;
+            if (Number.isFinite(pool.pendingFeesUsd)) lpTotals.feesUsd += pool.pendingFeesUsd;
+          }
         }
       } catch (error) {
         logger.error({ wallet, error: error.message }, "Pool check failed");
@@ -570,7 +584,12 @@ async function checkWallets(ctx, user, protocolFilter) {
     }
   }
   await deleteMessage(ctx, statusMsg.message_id);
-  const text = formatResultsByWallet(grouped);
+  let text = formatResultsByWallet(grouped);
+  if (text && lpTotals.count > 0) {
+    text +=
+      `\n\n💧 *LP total (${lpTotals.count} position${lpTotals.count === 1 ? "" : "s"})*\n` +
+      `Deposited: ${fmtUsdExact(lpTotals.valueUsd)} · Pending fees: ${fmtUsdExact(lpTotals.feesUsd)}`;
+  }
   ctx.reply(text || "No positions found", { parse_mode: "Markdown" });
 }
 
