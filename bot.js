@@ -38,7 +38,25 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const bot = new Telegraf(BOT_TOKEN);
+// handlerTimeout: /checkall scans many chains and can legitimately run for
+// minutes; Telegraf's default 90s would kill the handler mid-flight.
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 15 * 60 * 1000 });
+
+// A handler error (including a timeout) must NEVER crash the process — without
+// bot.catch Telegraf rethrows into an unhandled rejection and the whole bot dies
+// (then crash-loops on Railway while users see no replies).
+bot.catch((error, ctx) => {
+  logger.error(
+    { updateType: ctx?.updateType, chatId: ctx?.chat?.id, error: error?.message || String(error) },
+    "Unhandled bot handler error"
+  );
+});
+
+// Last-resort safety net: log stray rejections from background/network code
+// instead of letting Node kill the process.
+process.on("unhandledRejection", (reason) => {
+  logger.error({ error: reason?.message || String(reason) }, "Unhandled promise rejection");
+});
 
 // Transient per-chat UI state (pending input, menu index, current wallet) lives in
 // ctx.session, backed by the swappable keyv store (in-memory now, Redis via REDIS_URL).
@@ -457,6 +475,90 @@ async function removeWallet(ctx, wallet) {
   ctx.reply(`Wallet removed\n\n\`${wallet}\``, { parse_mode: "Markdown" });
 }
 
+// One wallet's full scan: lending, supplies and pools run concurrently; results
+// are merged into buckets in a fixed order afterwards (lending cards first, then
+// deposits, then pools) so the output is deterministic despite the parallelism.
+async function scanWalletForCheck(user, wallet, walletData, includePools) {
+  const protocol = walletData.protocol || "kamino";
+  const markets = walletData.markets || [];
+  const totals = { supplyUsd: 0, supplyCount: 0, lpValueUsd: 0, lpFeesUsd: 0, lpCount: 0 };
+
+  if (protocol === "tron") {
+    try {
+      const res = await getTronResources(wallet);
+      return { buckets: { tron: [formatTronResources(res)] }, totals };
+    } catch (error) {
+      logger.error({ wallet, error: error.message }, "Tron check failed");
+      return { buckets: { tron: [`Error: ${error.message}`] }, totals };
+    }
+  }
+
+  let lendingLines = null;
+  let supplies = [];
+  let pools = [];
+  let poolError = null;
+
+  await Promise.all([
+    (async () => {
+      try {
+        if (protocol === "kamino" && markets.length === 0) {
+          lendingLines = ["No markets cached. Use Refresh All"];
+          return;
+        }
+        const positions =
+          protocol === "aave" ? await checkAaveMarkets(wallet) : await checkSpecificMarkets(wallet, markets);
+        if (positions && positions.length > 0) {
+          lendingLines = positions.map(p => formatPosition({ user, wallet, position: p }));
+        }
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Check failed");
+        lendingLines = [`Error: ${error.message}`];
+      }
+    })(),
+    (async () => {
+      if (!includePools) return;
+      try {
+        supplies = (await scanSuppliesForWallet(wallet)).positions;
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Supply check failed");
+      }
+    })(),
+    (async () => {
+      if (!includePools) return;
+      try {
+        pools = (await scanPoolsForWallet(wallet)).positions;
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Pool check failed");
+        poolError = error.message;
+      }
+    })()
+  ]);
+
+  const buckets = {};
+  if (lendingLines) buckets[protocol] = lendingLines;
+
+  const threshold = getWalletThresholds(user, wallet).warningSupplyRate;
+  for (const supply of supplies) {
+    (buckets[supply.platform] ||= []).push(formatSupplyPosition(supply, threshold));
+    totals.supplyCount += 1;
+    if (Number.isFinite(supply.amountUsd)) totals.supplyUsd += supply.amountUsd;
+  }
+
+  if (poolError) {
+    const platform = detectWalletType(wallet) === "solana" ? "orca" : "uniswap";
+    buckets[platform] = [`Error: ${poolError}`];
+  } else if (pools.length > 0) {
+    buckets[pools[0].platform] = pools.map(p => formatPoolPosition(p));
+    for (const pool of pools) {
+      totals.lpCount += 1;
+      if (Number.isFinite(pool.valueUsd)) totals.lpValueUsd += pool.valueUsd;
+      if (Number.isFinite(pool.pendingFeesUsd)) totals.lpFeesUsd += pool.pendingFeesUsd;
+    }
+  }
+
+  return { buckets, totals };
+}
+
 async function checkWallets(ctx, user, protocolFilter) {
   const includePools = !protocolFilter || protocolFilter === "all";
   const wallets = Object.entries(user.wallets || {}).filter(([_, data]) => {
@@ -467,72 +569,26 @@ async function checkWallets(ctx, user, protocolFilter) {
     return ctx.reply("No wallets configured");
   }
   const statusMsg = await ctx.reply("Checking...");
+
+  // All wallets scanned in parallel (and each wallet's sources in parallel too):
+  // sequential scanning used to overrun Telegraf's handler timeout on /checkall.
+  const results = await Promise.all(
+    wallets.map(([wallet, walletData]) => scanWalletForCheck(user, wallet, walletData, includePools))
+  );
+
   const grouped = new Map();
   const lpTotals = { valueUsd: 0, feesUsd: 0, count: 0 };
   const supplyTotals = { usd: 0, count: 0 };
-  for (const [wallet, walletData] of wallets) {
-    if (!grouped.has(wallet)) grouped.set(wallet, {});
-    const protocol = walletData.protocol || "kamino";
-    const markets = walletData.markets || [];
-    if (protocol === "tron") {
-      try {
-        const res = await getTronResources(wallet);
-        grouped.get(wallet).tron = [formatTronResources(res)];
-      } catch (error) {
-        logger.error({ wallet, error: error.message }, "Tron check failed");
-        grouped.get(wallet).tron = [`Error: ${error.message}`];
-      }
-      continue;
-    }
-    try {
-      if (protocol === "kamino" && markets.length === 0) {
-        grouped.get(wallet)[protocol] = ["No markets cached. Use Refresh All"];
-      } else {
-        let positions;
-        if (protocol === "aave") {
-          positions = await checkAaveMarkets(wallet);
-        } else {
-          positions = await checkSpecificMarkets(wallet, markets);
-        }
-        if (positions && positions.length > 0) {
-          grouped.get(wallet)[protocol] = positions.map(p => formatPosition({ user, wallet, position: p }));
-        }
-      }
-    } catch (error) {
-      logger.error({ wallet, error: error.message }, "Check failed");
-      grouped.get(wallet)[protocol] = [`Error: ${error.message}`];
-    }
-    if (includePools) {
-      try {
-        const { positions: supplies } = await scanSuppliesForWallet(wallet);
-        const threshold = getWalletThresholds(user, wallet).warningSupplyRate;
-        const bucket = grouped.get(wallet);
-        for (const supply of supplies) {
-          (bucket[supply.platform] ||= []).push(formatSupplyPosition(supply, threshold));
-          supplyTotals.count += 1;
-          if (Number.isFinite(supply.amountUsd)) supplyTotals.usd += supply.amountUsd;
-        }
-      } catch (error) {
-        logger.error({ wallet, error: error.message }, "Supply check failed");
-      }
-      try {
-        const { positions: pools } = await scanPoolsForWallet(wallet);
-        if (pools.length > 0) {
-          const platform = pools[0].platform;
-          grouped.get(wallet)[platform] = pools.map(p => formatPoolPosition(p));
-          for (const pool of pools) {
-            lpTotals.count += 1;
-            if (Number.isFinite(pool.valueUsd)) lpTotals.valueUsd += pool.valueUsd;
-            if (Number.isFinite(pool.pendingFeesUsd)) lpTotals.feesUsd += pool.pendingFeesUsd;
-          }
-        }
-      } catch (error) {
-        logger.error({ wallet, error: error.message }, "Pool check failed");
-        const platform = detectWalletType(wallet) === "solana" ? "orca" : "uniswap";
-        grouped.get(wallet)[platform] = [`Error: ${error.message}`];
-      }
-    }
-  }
+  wallets.forEach(([wallet], index) => {
+    const { buckets, totals } = results[index];
+    grouped.set(wallet, buckets);
+    supplyTotals.count += totals.supplyCount;
+    supplyTotals.usd += totals.supplyUsd;
+    lpTotals.count += totals.lpCount;
+    lpTotals.valueUsd += totals.lpValueUsd;
+    lpTotals.feesUsd += totals.lpFeesUsd;
+  });
+
   await deleteMessage(ctx, statusMsg.message_id);
   let text = formatResultsByWallet(grouped);
   if (text && supplyTotals.count > 0) {
