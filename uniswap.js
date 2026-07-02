@@ -197,15 +197,19 @@ async function getUniswapPositionsForNetwork(networkKey, walletAddress) {
   });
 }
 
+// Returns { positions, failures } — failures lists the id prefix of each network
+// whose scan failed, so the alert checker can keep (not prune) previous range
+// state for positions it couldn't see this cycle.
 export async function getUniswapPositionsForWallet(walletAddress) {
-  const results = [];
+  const positions = [];
+  const failures = [];
   for (const network of NETWORKS) {
     try {
-      const positions = await getUniswapPositionsForNetwork(network.key, walletAddress);
-      results.push(...positions);
+      positions.push(...(await getUniswapPositionsForNetwork(network.key, walletAddress)));
     } catch (error) {
+      failures.push(`uniswap:${network.key}:`);
       logger.error({ network: network.key, walletAddress, error: error.message }, "Uniswap scan failed");
     }
   }
-  return results;
+  return { positions, failures };
 }

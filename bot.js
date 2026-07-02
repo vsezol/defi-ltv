@@ -1,23 +1,31 @@
 import { Telegraf, Markup, session } from "telegraf";
 import { fetchMarkets, scanAllMarketsForWallet, checkSpecificMarkets } from "./kamino.js";
 import { fetchAaveMarketsAll, scanAaveMarketsForWallet, checkAaveMarkets } from "./aave.js";
-import { getOrcaPositionsForWallet } from "./orca.js";
-import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, tronReclaimInfo, computeTronFlags } from "./tron.js";
 import { getTopLpPools } from "./toplp.js";
+import {
+  getGlobalDefaults,
+  getWalletThresholds,
+  detectWalletType,
+  scanPoolsForWallet,
+  scanSuppliesForWallet,
+  isSupplyBelow,
+  addWalletCore
+} from "./core.js";
+import { startWebServer } from "./server.js";
 import {
   initDb,
   closeDb,
   getUser,
   getAllUsers,
   getUserCount,
-  upsertWallet,
   deleteWallet,
   setGlobalThreshold,
   setWalletThreshold,
   resetWalletThresholds,
   setWalletMarkets,
   setWalletPoolStates,
+  setWalletSupplyStates,
   setWalletTronState
 } from "./db.js";
 import { uiCache } from "./cache.js";
@@ -39,20 +47,17 @@ bot.use(session({ store: uiCache, defaultSession: () => ({}) }));
 const CHECK_INTERVAL = 10 * 60 * 1000;
 const TRON_CHECK_INTERVAL = 60 * 60 * 1000;
 
-// Code-level fallbacks. Used when neither the wallet nor the global defaults set a value.
-const DEFAULT_WARNING_HEALTH_FACTOR = 1.5;
-const DEFAULT_DANGER_HEALTH_FACTOR = 1.3;
-const DEFAULT_WARNING_BORROW_RATE = 10; // %
-const DEFAULT_DANGER_BORROW_RATE = 15; // %
-
 // Maps short callback/command codes to threshold fields.
 // kind "hf"   -> alert when value is BELOW the threshold (lower health factor = riskier)
 // kind "rate" -> alert when value is ABOVE the threshold (higher borrow rate = costlier)
+// warningSupplyRate is a "rate" for formatting, but alerts fire when the deposit
+// APY falls BELOW it (lower supply yield = worse).
 const THRESHOLD_FIELDS = {
   whf: { key: "warningHealthFactor", label: "Warning HF", kind: "hf" },
   dhf: { key: "dangerHealthFactor", label: "Danger HF", kind: "hf" },
   wbr: { key: "warningBorrowRate", label: "Warning Rate", kind: "rate" },
-  dbr: { key: "dangerBorrowRate", label: "Danger Rate", kind: "rate" }
+  dbr: { key: "dangerBorrowRate", label: "Danger Rate", kind: "rate" },
+  wsr: { key: "warningSupplyRate", label: "Warning Supply APY", kind: "rate" }
 };
 
 async function deleteMessage(ctx, messageId) {
@@ -71,41 +76,6 @@ async function editMessage(ctx, messageId, text) {
   }
 }
 
-function isEvmAddress(address) {
-  return /^0x[a-fA-F0-9]{40}$/.test(address);
-}
-
-const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-function base58Decode(str) {
-  if (!str || /[^123456789A-HJ-NP-Za-km-z]/.test(str)) return null;
-  let num = 0n;
-  for (const ch of str) {
-    num = num * 58n + BigInt(BASE58_ALPHABET.indexOf(ch));
-  }
-  const bytes = [];
-  while (num > 0n) {
-    bytes.unshift(Number(num & 0xffn));
-    num >>= 8n;
-  }
-  for (const ch of str) {
-    if (ch === "1") bytes.unshift(0);
-    else break;
-  }
-  return bytes;
-}
-
-// Tron decodes to 25 bytes (0x41 prefix + checksum); Solana pubkeys to 32 bytes.
-function detectWalletType(address) {
-  if (isEvmAddress(address)) return "evm";
-  const bytes = base58Decode(address);
-  if (bytes) {
-    if (bytes.length === 25 && bytes[0] === 0x41) return "tron";
-    if (bytes.length === 32) return "solana";
-  }
-  return "unknown";
-}
-
 // Durable data (wallets, settings) comes from Postgres. Transient UI state lives
 // in ctx.session, so handlers read/write ctx.session.* directly (no manual save).
 async function ensureUser(chatId) {
@@ -113,29 +83,6 @@ async function ensureUser(chatId) {
   if (!user.wallets) user.wallets = {};
   if (!user.settings) user.settings = {};
   return user;
-}
-
-// User-configurable global defaults, falling back to code constants.
-function getGlobalDefaults(user) {
-  const s = user?.settings || {};
-  return {
-    warningHealthFactor: s.warningHealthFactor ?? DEFAULT_WARNING_HEALTH_FACTOR,
-    dangerHealthFactor: s.dangerHealthFactor ?? DEFAULT_DANGER_HEALTH_FACTOR,
-    warningBorrowRate: s.warningBorrowRate ?? DEFAULT_WARNING_BORROW_RATE,
-    dangerBorrowRate: s.dangerBorrowRate ?? DEFAULT_DANGER_BORROW_RATE
-  };
-}
-
-// Effective thresholds for a wallet: per-wallet override -> global default -> constant.
-function getWalletThresholds(user, wallet) {
-  const defaults = getGlobalDefaults(user);
-  const w = user?.wallets?.[wallet]?.settings || {};
-  return {
-    warningHealthFactor: w.warningHealthFactor ?? defaults.warningHealthFactor,
-    dangerHealthFactor: w.dangerHealthFactor ?? defaults.dangerHealthFactor,
-    warningBorrowRate: w.warningBorrowRate ?? defaults.warningBorrowRate,
-    dangerBorrowRate: w.dangerBorrowRate ?? defaults.dangerBorrowRate
-  };
 }
 
 // 0 = ok, 1 = warning, 2 = danger. Worst of the health-factor and borrow-rate checks.
@@ -161,12 +108,15 @@ function formatThresholdValue(field, value) {
   return field.kind === "rate" ? `${value}%` : `${value}`;
 }
 
-// LP positions (Orca for Solana wallets, Uniswap V3 for EVM wallets).
-async function scanPoolsForWallet(wallet) {
-  const walletType = detectWalletType(wallet);
-  if (walletType === "solana") return getOrcaPositionsForWallet(wallet);
-  if (walletType === "evm") return getUniswapPositionsForWallet(wallet);
-  return [];
+function formatSupplyPosition(position, threshold, transition) {
+  const below = isSupplyBelow(position, threshold);
+  const prefix = below ? "🔻 " : "💰 ";
+  const apy = Number.isFinite(position.supplyApy) ? `${position.supplyApy}%` : "?";
+  let line = `Deposited: ${fmtUsdExact(position.amountUsd)} · APY ${apy}`;
+  if (transition) {
+    line += below ? ` (dropped below ${threshold}%)` : ` (recovered above ${threshold}%)`;
+  }
+  return `${prefix}${position.asset} — ${position.market}:\n${line}`;
 }
 
 function formatPoolPrice(value) {
@@ -320,6 +270,7 @@ function settingsMenu(user) {
       Markup.button.callback(`Warning Rate: ${d.warningBorrowRate}%`, "def:set:wbr"),
       Markup.button.callback(`Danger Rate: ${d.dangerBorrowRate}%`, "def:set:dbr")
     ],
+    [Markup.button.callback(`Warning Supply APY: ${d.warningSupplyRate}%`, "def:set:wsr")],
     [Markup.button.callback("Back", "menu:main")]
   ]);
 }
@@ -355,6 +306,7 @@ function walletSettingsMenu(user, wallet) {
       Markup.button.callback(`Warning Rate: ${t.warningBorrowRate}%`, "wallet:set:wbr"),
       Markup.button.callback(`Danger Rate: ${t.dangerBorrowRate}%`, "wallet:set:dbr")
     ],
+    [Markup.button.callback(`Warning Supply APY: ${t.warningSupplyRate}%`, "wallet:set:wsr")],
     [Markup.button.callback("Reset to defaults", "wallet:reset")],
     [Markup.button.callback("Back", "wallet:back")]
   ]);
@@ -371,13 +323,15 @@ function formatWalletSettings(user, wallet) {
     `Warning HF: ${t.warningHealthFactor}${mark("warningHealthFactor")}`,
     `Danger HF: ${t.dangerHealthFactor}${mark("dangerHealthFactor")}`,
     `Warning Rate: ${t.warningBorrowRate}%${mark("warningBorrowRate")}`,
-    `Danger Rate: ${t.dangerBorrowRate}%${mark("dangerBorrowRate")}`
+    `Danger Rate: ${t.dangerBorrowRate}%${mark("dangerBorrowRate")}`,
+    `Warning Supply APY: ${t.warningSupplyRate}%${mark("warningSupplyRate")}`
   ].join("\n");
 }
 
 const PLATFORM_LABELS = {
   kamino: "*KAMINO*",
   aave: "*AAVE*",
+  fluid: "*FLUID*",
   orca: "*ORCA*",
   uniswap: "*UNISWAP*",
   tron: "*TRON*"
@@ -385,7 +339,7 @@ const PLATFORM_LABELS = {
 
 function formatResultsByWallet(resultsByWallet) {
   const output = [];
-  const protocolsOrder = ["kamino", "aave", "orca", "uniswap", "tron"];
+  const protocolsOrder = ["kamino", "aave", "fluid", "orca", "uniswap", "tron"];
   for (const [wallet, protocols] of resultsByWallet.entries()) {
     const protocolKeys = Object.keys(protocols);
     if (protocolKeys.length === 0) continue;
@@ -422,41 +376,27 @@ async function addWallet(ctx, wallet) {
   const protocol = walletType === "evm" ? "aave" : "kamino";
   const statusMsg = await ctx.reply(protocol === "aave" ? "Checking Aave..." : "Scanning all markets...");
   try {
-    let positions;
-    if (protocol === "aave") {
-      positions = await scanAaveMarketsForWallet(wallet);
-    } else {
-      positions = await scanAllMarketsForWallet(wallet, (marketCheck) => {
+    const result = await addWalletCore(chatId, wallet, {
+      onKaminoProgress: (marketCheck) => {
         editMessage(ctx, statusMsg.message_id, `Scanning market ${marketCheck.current + 1} of ${marketCheck.total}...`);
-      });
-    }
-    let pools = [];
-    try {
-      pools = await scanPoolsForWallet(wallet);
-    } catch (error) {
-      logger.error({ wallet, error: error.message }, "Pool scan failed on add");
-    }
+      }
+    });
     await deleteMessage(ctx, statusMsg.message_id);
-    if ((!positions || positions.length === 0) && pools.length === 0) {
+    if (result.empty) {
       return ctx.reply("No positions found for this wallet");
     }
-    const marketNames = (positions || []).map(p => p.market);
-    const poolStates = {};
-    for (const pool of pools) poolStates[pool.id] = pool.inRange;
-    try {
-      await upsertWallet(chatId, wallet, { protocol, markets: marketNames, poolStates });
-    } catch (error) {
-      logger.error({ chatId, wallet, error: error.message }, "Failed to save wallet");
-      return ctx.reply(`Scanned ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
-    }
-    logger.info({ chatId, wallet, markets: marketNames, pools: pools.length }, "Wallet added");
     const user = await getUser(chatId);
-    const lines = (positions || []).map(p => formatPosition({ user, wallet, position: p }));
-    lines.push(...pools.map(p => formatPoolPosition(p)));
+    const threshold = getWalletThresholds(user, wallet).warningSupplyRate;
+    const lines = result.positions.map(p => formatPosition({ user, wallet, position: p }));
+    lines.push(...result.supplies.map(s => formatSupplyPosition(s, threshold)));
+    lines.push(...result.pools.map(p => formatPoolPosition(p)));
     ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
   } catch (error) {
     await deleteMessage(ctx, statusMsg.message_id);
     logger.error({ chatId, wallet, error: error.message }, "Failed to add wallet");
+    if (error.stage === "save") {
+      return ctx.reply(`Scanned ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
+    }
     ctx.reply(`Error: ${error.message}`);
   }
 }
@@ -465,19 +405,16 @@ async function addTronWallet(ctx, wallet) {
   const chatId = String(ctx.chat.id);
   const statusMsg = await ctx.reply("Checking Tron resources...");
   try {
-    const res = await getTronResources(wallet);
+    const result = await addWalletCore(chatId, wallet);
     await deleteMessage(ctx, statusMsg.message_id);
-    try {
-      await upsertWallet(chatId, wallet, { protocol: "tron", tronState: computeTronFlags(res) });
-    } catch (error) {
-      logger.error({ chatId, wallet, error: error.message }, "Failed to save Tron wallet");
-      return ctx.reply(`Checked ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
-    }
     logger.info({ chatId, wallet }, "Tron wallet added");
-    ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n*TRON*\n${formatTronResources(res)}`, { parse_mode: "Markdown" });
+    ctx.reply(`Wallet added!\n\n\`${wallet}\`\n\n*TRON*\n${formatTronResources(result.tron)}`, { parse_mode: "Markdown" });
   } catch (error) {
     await deleteMessage(ctx, statusMsg.message_id);
     logger.error({ chatId, wallet, error: error.message }, "Failed to add Tron wallet");
+    if (error.stage === "save") {
+      return ctx.reply(`Checked ${formatWalletLabel(wallet)} but couldn't save it — please try again.`);
+    }
     ctx.reply(`Error: ${error.message}`);
   }
 }
@@ -532,6 +469,7 @@ async function checkWallets(ctx, user, protocolFilter) {
   const statusMsg = await ctx.reply("Checking...");
   const grouped = new Map();
   const lpTotals = { valueUsd: 0, feesUsd: 0, count: 0 };
+  const supplyTotals = { usd: 0, count: 0 };
   for (const [wallet, walletData] of wallets) {
     if (!grouped.has(wallet)) grouped.set(wallet, {});
     const protocol = walletData.protocol || "kamino";
@@ -566,7 +504,19 @@ async function checkWallets(ctx, user, protocolFilter) {
     }
     if (includePools) {
       try {
-        const pools = await scanPoolsForWallet(wallet);
+        const { positions: supplies } = await scanSuppliesForWallet(wallet);
+        const threshold = getWalletThresholds(user, wallet).warningSupplyRate;
+        const bucket = grouped.get(wallet);
+        for (const supply of supplies) {
+          (bucket[supply.platform] ||= []).push(formatSupplyPosition(supply, threshold));
+          supplyTotals.count += 1;
+          if (Number.isFinite(supply.amountUsd)) supplyTotals.usd += supply.amountUsd;
+        }
+      } catch (error) {
+        logger.error({ wallet, error: error.message }, "Supply check failed");
+      }
+      try {
+        const { positions: pools } = await scanPoolsForWallet(wallet);
         if (pools.length > 0) {
           const platform = pools[0].platform;
           grouped.get(wallet)[platform] = pools.map(p => formatPoolPosition(p));
@@ -585,6 +535,11 @@ async function checkWallets(ctx, user, protocolFilter) {
   }
   await deleteMessage(ctx, statusMsg.message_id);
   let text = formatResultsByWallet(grouped);
+  if (text && supplyTotals.count > 0) {
+    text +=
+      `\n\n💰 *Deposits total (${supplyTotals.count} position${supplyTotals.count === 1 ? "" : "s"})*\n` +
+      `Supplied: ${fmtUsdExact(supplyTotals.usd)}`;
+  }
   if (text && lpTotals.count > 0) {
     text +=
       `\n\n💧 *LP total (${lpTotals.count} position${lpTotals.count === 1 ? "" : "s"})*\n` +
@@ -635,6 +590,7 @@ bot.start((ctx) => {
     "LTV Watch Bot\n\n" +
     "Monitors for your wallets:\n" +
     "• Health Factor / LTV / borrow rate (Kamino, Aave)\n" +
+    "• Lending deposits & supply APY (Kamino Earn, Aave, Fluid) — alerts when APY drops\n" +
     "• LP position ranges (Orca, Uniswap V3)\n" +
     "• Tron resources: energy/bandwidth, delegation & reclaim\n\n" +
     "Send wallet address(es) — one per line — to start monitoring them.\n\n" +
@@ -764,7 +720,7 @@ bot.action(/wallet:remove:(\d+)/, async (ctx) => {
   await ctx.editMessageText("Wallets", walletMenu(user));
 });
 
-bot.action(/wallet:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
+bot.action(/wallet:set:(whf|dhf|wbr|dbr|wsr)/, async (ctx) => {
   await ctx.answerCbQuery();
   const chatId = String(ctx.chat.id);
   const user = await ensureUser(chatId);
@@ -801,7 +757,7 @@ bot.action("wallet:back", async (ctx) => {
   await ctx.editMessageText("Wallets", walletMenu(user));
 });
 
-bot.action(/def:set:(whf|dhf|wbr|dbr)/, async (ctx) => {
+bot.action(/def:set:(whf|dhf|wbr|dbr|wsr)/, async (ctx) => {
   await ctx.answerCbQuery();
   const field = ctx.match[1];
   ctx.session.pending = { action: "setdefault", field };
@@ -894,10 +850,21 @@ async function checkLendingForWallet(chatId, user, wallet, walletData) {
   await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
 }
 
+// A position missing from this scan because its source (chain/network) failed must
+// keep its previous alert state — pruning it would silently re-seed the baseline on
+// recovery and swallow any threshold/range crossing that happened around the outage.
+function carryOverFailedSources(next, previous, failures) {
+  if (failures.length === 0) return;
+  for (const [id, state] of Object.entries(previous)) {
+    if (id in next) continue;
+    if (failures.some((prefix) => id.startsWith(prefix))) next[id] = state;
+  }
+}
+
 // Notify only when a pool position crosses the range boundary (in <-> out).
 // First sighting of a position just records the baseline state silently.
 async function checkPoolsForWallet(chatId, wallet, walletData) {
-  const pools = await scanPoolsForWallet(wallet);
+  const { positions: pools, failures } = await scanPoolsForWallet(wallet);
   const previous = walletData.poolStates || {};
   const next = {};
   const transitions = [];
@@ -911,6 +878,7 @@ async function checkPoolsForWallet(chatId, wallet, walletData) {
       transitions.push(pool);
     }
   }
+  carryOverFailedSources(next, previous, failures);
 
   if (seeded.length > 0) {
     logger.info({ chatId, wallet, seeded }, "Pool baseline recorded");
@@ -939,6 +907,53 @@ async function checkPoolsForWallet(chatId, wallet, walletData) {
   }
 }
 
+// Notify only when a deposit's APY crosses the warning threshold (below <-> above).
+// First sighting of a position just records the baseline state silently.
+async function checkSuppliesForWallet(chatId, user, wallet, walletData) {
+  const { positions: supplies, failures } = await scanSuppliesForWallet(wallet);
+  const threshold = getWalletThresholds(user, wallet).warningSupplyRate;
+  const previous = walletData.supplyStates || {};
+  const next = {};
+  const transitions = [];
+  const seeded = [];
+
+  for (const supply of supplies) {
+    const below = isSupplyBelow(supply, threshold);
+    next[supply.id] = below;
+    if (!(supply.id in previous)) {
+      seeded.push(`${supply.asset} = ${below ? "below" : "ok"}`);
+    } else if (previous[supply.id] !== below) {
+      transitions.push(supply);
+    }
+  }
+  carryOverFailedSources(next, previous, failures);
+
+  if (seeded.length > 0) {
+    logger.info({ chatId, wallet, seeded }, "Supply baseline recorded");
+  }
+
+  if (transitions.length > 0) {
+    logger.info(
+      { chatId, wallet, threshold, transitions: transitions.map((s) => `${s.asset} @ ${s.supplyApy}%`) },
+      "Supply APY transition"
+    );
+
+    const grouped = new Map();
+    grouped.set(wallet, {});
+    const protocols = grouped.get(wallet);
+    for (const supply of transitions) {
+      (protocols[supply.platform] ||= []).push(formatSupplyPosition(supply, threshold, true));
+    }
+    // Send BEFORE persisting the new state: if sending fails (throws), the old
+    // state is kept and the transition fires again on the next cycle.
+    await bot.telegram.sendMessage(chatId, formatResultsByWallet(grouped), { parse_mode: "Markdown" });
+  }
+
+  if (JSON.stringify(next) !== JSON.stringify(previous)) {
+    await setWalletSupplyStates(chatId, wallet, next);
+  }
+}
+
 async function checkAllUsers() {
   try {
     for (const [chatId, user] of await getAllUsers()) {
@@ -952,6 +967,12 @@ async function checkAllUsers() {
           await checkLendingForWallet(chatId, user, wallet, walletData);
         } catch (error) {
           logger.error({ chatId, wallet, error: error.message }, "Check failed");
+        }
+        try {
+          await checkSuppliesForWallet(chatId, user, wallet, walletData);
+        } catch (error) {
+          // Keep previous supplyStates on scan failure to avoid phantom transitions.
+          logger.error({ chatId, wallet, error: error.message }, "Supply check failed");
         }
         try {
           await checkPoolsForWallet(chatId, wallet, walletData);
@@ -1050,6 +1071,19 @@ async function init() {
     logger.info({ count: userCount }, "Users loaded");
     setTimeout(checkAllUsers, 5000);
     setTimeout(checkAllTron, 15000);
+  }
+
+  // Mini App: HTTP API + static bundle in the same process (bot stays on long polling).
+  startWebServer(BOT_TOKEN);
+  if (process.env.WEBAPP_URL) {
+    try {
+      await bot.telegram.setChatMenuButton({
+        menuButton: { type: "web_app", text: "App", web_app: { url: process.env.WEBAPP_URL } }
+      });
+      logger.info({ url: process.env.WEBAPP_URL }, "Menu button set to Mini App");
+    } catch (error) {
+      logger.error({ error: error.message }, "Failed to set Mini App menu button");
+    }
   }
 
   bot.launch();

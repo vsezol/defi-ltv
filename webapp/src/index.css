@@ -1,0 +1,14 @@
+/* telegram-web-app.js sets --tg-theme-* on :root; tgui vars are scoped to AppRoot */
+body {
+  margin: 0;
+  background: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #fff));
+}
+
+/* app container lives inside AppRoot, so tgui variables resolve here */
+.app-content {
+  min-height: 100vh;
+  box-sizing: border-box;
+  background: var(--tgui--secondary_bg_color);
+  /* room for the fixed bottom tabbar */
+  padding-bottom: 96px;
+}

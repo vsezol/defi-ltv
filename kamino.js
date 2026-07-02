@@ -105,6 +105,66 @@ function parseObligation(obl, marketName, borrowApyByReserve) {
   };
 }
 
+// Kamino Earn (kVault) deposit positions. These live outside the lending
+// obligations entirely — /kvaults endpoints, shares are human-scaled decimals.
+// Returns { positions, failures } — failures lists the id of each vault whose
+// detail fetch failed, so callers can keep previous alert state for it. A failure
+// of the positions list itself throws (whole source down -> caller keeps all state).
+export async function getKaminoSupplies(walletAddress) {
+  const response = await fetch(`${KAMINO_API}/kvaults/users/${walletAddress}/positions`);
+  if (!response.ok) {
+    if (response.status === 404) return { positions: [], failures: [] };
+    throw new Error(`API Error: ${response.status}`);
+  }
+  const positions = await response.json();
+  const active = (positions || []).filter((p) => parseFloat(p.totalShares) > 0);
+  if (active.length === 0) return { positions: [], failures: [] };
+
+  // Portfolio gives the token symbol per vault (vault details don't carry one).
+  let earnByVault = new Map();
+  try {
+    const portfolio = await fetch(`${KAMINO_API}/portfolio/${walletAddress}`);
+    if (portfolio.ok) {
+      const data = await portfolio.json();
+      earnByVault = new Map((data.earn || []).map((e) => [e.vault, e]));
+    }
+  } catch {
+    // symbol is cosmetic — fall back to "?" below
+  }
+
+  const results = [];
+  const failures = [];
+  for (const p of active) {
+    try {
+      const [vaultRes, metricsRes] = await Promise.all([
+        fetch(`${KAMINO_API}/kvaults/vaults/${p.vaultAddress}`),
+        fetch(`${KAMINO_API}/kvaults/vaults/${p.vaultAddress}/metrics`)
+      ]);
+      if (!vaultRes.ok || !metricsRes.ok) throw new Error(`API Error: ${vaultRes.status}/${metricsRes.status}`);
+      const [vault, metrics] = await Promise.all([vaultRes.json(), metricsRes.json()]);
+
+      const shares = parseFloat(p.totalShares);
+      const sharePrice = parseFloat(metrics.sharePrice);
+      const tokensPerShare = parseFloat(metrics.tokensPerShare);
+      // apy is a decimal fraction ("0.079" = 7.9%), same convention as borrowApy.
+      const apy = parseFloat(metrics.apy);
+      results.push({
+        id: `kvault:${p.vaultAddress}`,
+        platform: "kamino",
+        market: vault.state?.name || p.vaultAddress,
+        asset: earnByVault.get(p.vaultAddress)?.symbol || "?",
+        amount: Number.isFinite(tokensPerShare) ? shares * tokensPerShare : null,
+        amountUsd: Number.isFinite(sharePrice) ? shares * sharePrice : null,
+        supplyApy: Number.isFinite(apy) ? Math.round(apy * 100 * 100) / 100 : null
+      });
+    } catch (error) {
+      failures.push(`kvault:${p.vaultAddress}`);
+      logger.warn({ vault: p.vaultAddress, error: error.message }, "kVault fetch failed");
+    }
+  }
+  return { positions: results, failures };
+}
+
 export async function scanAllMarketsForWallet(walletAddress, marketCheckCallback) {
   const markets = await getCachedMarkets();
 

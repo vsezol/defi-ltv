@@ -2,9 +2,13 @@
 
 Telegram bot that monitors your DeFi positions:
 
-- **Lending** — Health Factor (HF), LTV and borrow rate on **Kamino** (Solana)
-  and **Aave V3** (Ethereum, Arbitrum, Base), alerting when a position crosses
-  your Warning/Danger threshold.
+- **Lending (borrow)** — Health Factor (HF), LTV and borrow rate on **Kamino**
+  (Solana) and **Aave V3** (Ethereum, Arbitrum, Base), alerting when a position
+  crosses your Warning/Danger threshold.
+- **Lending (deposits)** — supply positions and their APY on **Kamino Earn**
+  (kVaults, Solana), **Aave V3** and **Fluid** (Ethereum, Arbitrum, Base,
+  Polygon), alerting when a deposit's APY **drops below** your Warning Supply
+  APY threshold (and again when it recovers). Transition-only, like pool alerts.
 - **LP pools** — concentrated-liquidity positions on **Orca** (Solana) and
   **Uniswap V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a position
   goes **out of range** or comes back **in range**. Each position shows its
@@ -17,14 +21,19 @@ Telegram bot that monitors your DeFi positions:
   pools **paired with USDC/USDT** across the top-5 EVM chains by a **fee-weighted score** (30d vol / TVL × fee%)
   (capital efficiency), liquidity > $100k. Two lists (BTC, ETH), top 10 each, with
   direct Uniswap links. `/toplpl2` excludes Ethereum L1 (lower-gas chains only).
+- **Telegram Mini App** — a React web app (served by the bot process) for
+  managing wallets, thresholds and viewing positions; notifications stay in the
+  bot chat. Auto dark/light theme following Telegram.
 
 ## How it works
 
 - Add a wallet — platforms are auto-detected from the address format
   (`0x…` → Aave + Uniswap V3, `T…` → Tron, Solana base58 → Kamino + Orca).
-- Every 10 minutes it re-checks lending/LP positions and pings you on Telegram
-  when:
+- Every 10 minutes it re-checks lending/deposit/LP positions and pings you on
+  Telegram when:
   - `HF ≤ Warning` **or** `borrow rate ≥ Warning` (lending), or
+  - a deposit's **supply APY crosses the Warning Supply APY threshold** (drops
+    below it, or recovers back above) — transition-only, or
   - an LP position **crosses the range boundary** (in ↔ out). Range alerts fire
     only on the transition, not repeatedly while it stays out of range.
 - Tron wallets are checked **hourly** (resource state changes slowly). Alerts
@@ -51,14 +60,19 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 | File | Purpose |
 | :--- | :--- |
 | `bot.js` | Entry point: Telegram bot, commands, menu, background check loop. |
-| `kamino.js` | Kamino markets & positions via `https://api.kamino.finance`. |
-| `aave.js` | Aave V3 positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), with multi-RPC fallback. |
+| `core.js` | Shared logic (bot + Mini App API): wallet type detection, thresholds/defaults, pool & supply scan dispatchers, add-wallet flow. |
+| `kamino.js` | Kamino lending positions + Kamino Earn (kVault) deposits via `https://api.kamino.finance`. |
+| `aave.js` | Aave V3 borrow + supply positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), with multi-RPC fallback. |
+| `fluid.js` | Fluid (Instadapp) lending deposits via `api.fluid.instadapp.io` (fToken positions + supply APR). |
 | `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
 | `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
 | `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by a fee-weighted score (30d vol/TVL × fee%) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
 | `db.js` | PostgreSQL (`pg`): users + wallets, granular atomic per-row ops; schema bootstrap. |
 | `cache.js` | keyv wrapper for ephemeral cache (markets, UI state); in-memory or Redis. |
+| `server.js` | Express: Mini App REST API (`/api/*`, initData-authenticated) + static webapp bundle. |
+| `webapp-auth.js` | Telegram initData HMAC validation (no deps). |
+| `webapp/` | Mini App frontend: React + `@telegram-apps/telegram-ui` + Vite. |
 | `logger.js` | Logging (pino; pretty output in dev). |
 
 ## Requirements
@@ -82,8 +96,25 @@ npm run dev            # loads .env automatically (--env-file=.env)
 1. Project → **New → Database → Add PostgreSQL**.
 2. Bot service → **Variables** → `DATABASE_URL = ${{Postgres.DATABASE_URL}}`
    (reference var → resolves to the internal `*.railway.internal` host: no egress, no SSL).
-3. Redeploy. `npm start` runs the bot; tables are created on first boot.
-4. (Optional Redis cache: add a Redis service, set `REDIS_URL = ${{Redis.REDIS_URL}}`, `npm i @keyv/redis`.)
+3. Redeploy. `npm start` runs the bot; tables are created on first boot
+   (`npm run build` builds the Mini App bundle during deploy).
+4. **Mini App**: Settings → Networking → **Generate Domain**, then set
+   `WEBAPP_URL = https://<app>.up.railway.app`. On the next boot the bot points
+   its menu button at the app.
+5. (Optional Redis cache: add a Redis service, set `REDIS_URL = ${{Redis.REDIS_URL}}`, `npm i @keyv/redis`.)
+
+## Mini App
+
+- Open it from the bot's **menu button** (set automatically when `WEBAPP_URL` is configured).
+- Three tabs: **Positions** (on-demand scan of everything: deposits, lending,
+  LP pools, Tron — with totals), **Wallets** (add one or many, remove),
+  **Settings** (global defaults + per-wallet threshold overrides).
+- Auth: every `/api` request carries Telegram's signed `initData`; the server
+  validates the HMAC with the bot token — no separate accounts.
+- Local dev: `npm run dev` (bot + API on :3000), `cd webapp && npx vite` (UI on
+  :5173 with `/api` proxied). To open inside Telegram it must be HTTPS — tunnel
+  with `cloudflared tunnel --url http://localhost:5173` and point a dev bot's
+  menu button at the tunnel URL.
 
 ## Environment
 
@@ -94,6 +125,8 @@ npm run dev            # loads .env automatically (--env-file=.env)
 | `REDIS_URL` | no | Redis URL for the ephemeral cache. Unset → in-memory. Requires `@keyv/redis`. |
 | `NODE_ENV` | no | `production` → plain JSON logs; anything else → pretty dev logs. |
 | `SOLANA_RPC_URL` | no | Solana RPC URL(s) for Orca scanning (comma-separated). Many public RPCs now block `getTokenAccountsByOwner`; set a private endpoint for reliable Orca monitoring. Falls back to keyless public RPCs. |
+| `WEBAPP_URL` | no | Public HTTPS URL of the Mini App. When set, the bot's menu button opens it. |
+| `PORT` | no | HTTP port for the Mini App server (default 3000; Railway injects it). |
 
 ## Bot commands
 
