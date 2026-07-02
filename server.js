@@ -1,13 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import express from "express";
-import {
-  validateInitData,
-  validateLoginWidget,
-  issueSessionToken,
-  verifySessionToken,
-  isValidInternalToken
-} from "./auth.js";
+import { validateInitData } from "./webapp-auth.js";
 import {
   DEFAULT_THRESHOLDS,
   getGlobalDefaults,
@@ -15,14 +9,11 @@ import {
   detectWalletType,
   scanPoolsForWallet,
   scanSuppliesForWallet,
-  addWalletCore,
-  positionSeverity,
-  refreshWalletsCore
+  addWalletCore
 } from "./core.js";
 import { checkSpecificMarkets } from "./kamino.js";
 import { checkAaveMarkets } from "./aave.js";
 import { getTronResources, tronReclaimInfo } from "./tron.js";
-import { getTopLpPools } from "./toplp.js";
 import { getUser, deleteWallet, setGlobalThreshold, setWalletThreshold, resetWalletThresholds } from "./db.js";
 import { logger } from "./logger.js";
 
@@ -57,9 +48,6 @@ async function scanWalletPositions(user, wallet, walletData) {
             ...p
           }));
         }
-        for (const p of result.lending) {
-          p.severity = positionSeverity(thresholds, p.healthFactor, p.borrowRate);
-        }
       } catch (error) {
         result.errors.push(`Lending: ${error.message}`);
       }
@@ -87,52 +75,22 @@ async function scanWalletPositions(user, wallet, walletData) {
   return result;
 }
 
-export function startWebServer({ botToken, internalToken, botUsername }) {
+export function startWebServer(botToken) {
   const app = express();
   app.use(express.json());
 
-  // --- public endpoints (no auth) ---
-
-  app.get("/api/config", (req, res) => {
-    res.json({ botUsername: botUsername || null });
-  });
-
-  // Standalone-browser sign-in: validate the Telegram Login Widget payload and
-  // issue a long-lived session JWT.
-  app.post("/api/auth/telegram-widget", (req, res) => {
-    try {
-      const user = validateLoginWidget(req.body, botToken);
-      res.json({ token: issueSessionToken(user.id, botToken) });
-    } catch (error) {
-      logger.warn({ error: error.message }, "Widget auth failed");
-      res.status(401).json({ error: "unauthorized" });
-    }
-  });
-
-  // --- authenticated API: tma <initData> | Bearer <jwt> | Internal <token> ---
-
+  // All /api routes require a valid Telegram Mini App initData signature.
   app.use("/api", (req, res, next) => {
     const [scheme, data] = (req.get("authorization") || "").split(" ");
+    if (scheme !== "tma" || !data) return res.status(401).json({ error: "unauthorized" });
     try {
-      if (scheme === "tma" && data) {
-        const tgUser = validateInitData(data, botToken);
-        req.chatId = String(tgUser.id); // private-chat id === user id
-        return next();
-      }
-      if (scheme === "Bearer" && data) {
-        req.chatId = verifySessionToken(data, botToken);
-        return next();
-      }
-      if (scheme === "Internal" && isValidInternalToken(data, internalToken)) {
-        const chatId = req.get("x-chat-id");
-        if (!chatId) return res.status(400).json({ error: "missing X-Chat-Id" });
-        req.chatId = String(chatId);
-        return next();
-      }
+      const tgUser = validateInitData(data, botToken);
+      req.chatId = String(tgUser.id); // private-chat id === user id
+      next();
     } catch (error) {
-      logger.warn({ scheme, error: error.message }, "API auth failed");
+      logger.warn({ error: error.message }, "Mini App auth failed");
+      res.status(401).json({ error: "unauthorized" });
     }
-    res.status(401).json({ error: "unauthorized" });
   });
 
   const handle = (fn) => async (req, res) => {
@@ -153,8 +111,7 @@ export function startWebServer({ botToken, internalToken, botUsername }) {
         wallets: Object.entries(user.wallets || {}).map(([address, w]) => ({
           address,
           protocol: w.protocol,
-          thresholds: w.settings || {},
-          effective: getWalletThresholds(user, address)
+          thresholds: w.settings || {}
         }))
       });
     })
@@ -180,29 +137,13 @@ export function startWebServer({ botToken, internalToken, botUsername }) {
           valid.slice(i, i + ADD_BATCH_SIZE).map(async (address) => {
             try {
               const result = await addWalletCore(req.chatId, address);
-              if (result.empty) return skipped.push({ address, reason: "no positions found" });
-              added.push({
-                address,
-                protocol: result.protocol,
-                positions: result.positions,
-                supplies: result.supplies,
-                pools: result.pools,
-                tron: result.tron || null
-              });
+              if (result.empty) skipped.push({ address, reason: "no positions found" });
+              else added.push({ address, protocol: result.protocol });
             } catch (error) {
               skipped.push({ address, reason: error.message });
             }
           })
         );
-      }
-      // Severity for the freshly added lending positions (bot renders the emoji).
-      const user = (await getUser(req.chatId)) || {};
-      for (const entry of added) {
-        const thresholds = getWalletThresholds(user, entry.address);
-        for (const p of entry.positions) {
-          p.platform = entry.protocol;
-          p.severity = positionSeverity(thresholds, p.healthFactor, p.borrowRate);
-        }
       }
       res.json({ added, skipped });
     })
@@ -259,12 +200,8 @@ export function startWebServer({ botToken, internalToken, botUsername }) {
   app.get(
     "/api/positions",
     handle(async (req, res) => {
-      const protocolFilter = String(req.query.protocol || "all");
       const user = (await getUser(req.chatId)) || {};
-      const entries = Object.entries(user.wallets || {}).filter(([_, data]) => {
-        if (protocolFilter === "all") return true;
-        return (data.protocol || "kamino") === protocolFilter;
-      });
+      const entries = Object.entries(user.wallets || {});
       const wallets = await Promise.all(
         entries.map(([wallet, walletData]) => scanWalletPositions(user, wallet, walletData))
       );
@@ -277,33 +214,6 @@ export function startWebServer({ botToken, internalToken, botUsername }) {
         }
       }
       res.json({ wallets, totals });
-    })
-  );
-
-  // Rescan lending markets for the user's wallets (bot "Refresh All" / protocol refresh).
-  app.post(
-    "/api/refresh",
-    handle(async (req, res) => {
-      const wallets = await refreshWalletsCore(req.chatId, req.body?.protocol || "all");
-      // Severity for the rescanned positions (the bot only renders it).
-      const user = (await getUser(req.chatId)) || {};
-      for (const entry of wallets) {
-        const thresholds = getWalletThresholds(user, entry.address);
-        for (const p of entry.positions) {
-          p.platform = entry.protocol;
-          p.severity = positionSeverity(thresholds, p.healthFactor, p.borrowRate);
-        }
-      }
-      res.json({ wallets });
-    })
-  );
-
-  app.get(
-    "/api/toplp",
-    handle(async (req, res) => {
-      const l2 = req.query.l2 === "1" || req.query.l2 === "true";
-      const result = await getTopLpPools(l2 ? { excludeChains: ["Ethereum"] } : {});
-      res.json(result);
     })
   );
 
