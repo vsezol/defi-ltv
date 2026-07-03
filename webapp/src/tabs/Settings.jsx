@@ -18,11 +18,8 @@ const FIELDS = [
   { key: "warningHealthFactor", label: "Warning HF" },
   { key: "dangerHealthFactor", label: "Danger HF" },
   { key: "warningBorrowRate", label: "Warning borrow rate %" },
-  { key: "dangerBorrowRate", label: "Danger borrow rate %" },
-  { key: "warningSupplyRate", label: "Warning supply APY %" }
+  { key: "dangerBorrowRate", label: "Danger borrow rate %" }
 ];
-
-const SUPPLY_FOOTER = "Warning supply APY %: alert when a deposit APY drops below this value.";
 
 export default function Settings({ state, loading, error, onRefresh }) {
   const [selectedAddress, setSelectedAddress] = useState(null);
@@ -136,7 +133,10 @@ export default function Settings({ state, loading, error, onRefresh }) {
     <>
       {!selectedWallet ? (
         <List>
-          <Section header="Global defaults" footer={SUPPLY_FOOTER}>
+          <Section
+            header="Global defaults"
+            footer="Thresholds that trigger warning and danger alerts for your borrow positions."
+          >
             {FIELDS.map((field) => (
               <Cell
                 key={field.key}
@@ -190,7 +190,6 @@ export default function Settings({ state, loading, error, onRefresh }) {
             header={[shortAddress(selectedWallet.address), selectedWallet.protocol]
               .filter(Boolean)
               .join(" · ")}
-            footer={SUPPLY_FOOTER}
           >
             {FIELDS.map((field) => {
               const override = selectedWallet.thresholds?.[field.key];

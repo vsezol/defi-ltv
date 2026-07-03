@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
@@ -7,10 +7,10 @@ import {
   List,
   Placeholder,
   Section,
-  Spinner
+  Skeleton
 } from "@telegram-apps/telegram-ui";
 import { api } from "../api.js";
-import { formatNumber, formatPercent, formatUsd, shortAddress } from "../format.js";
+import { formatNumber, formatPercent, shortAddress } from "../format.js";
 
 // Module-level cache: survives tab switches (component unmounts) without refetching.
 let cachedData = null;
@@ -34,7 +34,7 @@ function formatDate(value) {
 }
 
 function borrowRatesText(position) {
-  const rates = position?.borrowRates ?? position?.borrows;
+  const rates = position?.borrows;
   if (rates == null) return null;
   let parts;
   if (Array.isArray(rates)) {
@@ -57,6 +57,14 @@ function borrowRatesText(position) {
   return parts.length ? `Borrows: ${parts.join(" · ")}` : null;
 }
 
+// Map a lending position severity to a text color CSS variable.
+// The API sends a numeric level from positionSeverity: 0 = ok, 1 = warning, 2 = danger.
+function severityColor(severity) {
+  if (severity >= 2) return "var(--tgui--destructive_text_color)";
+  if (severity >= 1) return "var(--tgui--orange, #f5a623)";
+  return undefined;
+}
+
 function RangeBadge({ inRange }) {
   return inRange ? (
     <Badge type="number" mode="primary" style={{ background: "var(--tgui--green)" }}>
@@ -69,36 +77,21 @@ function RangeBadge({ inRange }) {
   );
 }
 
-function SupplyCell({ supply }) {
-  const apy = formatPercent(supply.supplyApy);
-  return (
-    <Cell
-      subhead={supply.platform || undefined}
-      subtitle={supply.market || undefined}
-      after={
-        <Info type="text" subtitle={apy ? `APY ${apy}` : undefined}>
-          {formatUsd(supply.amountUsd) ?? "—"}
-        </Info>
-      }
-    >
-      {supply.asset || "Supply"}
-    </Cell>
-  );
-}
-
 function LendingCell({ position }) {
   const parts = [];
   const ltv = formatPercent(position.ltv);
   if (ltv) parts.push(`LTV ${ltv}`);
+  const liqLtv = formatPercent(position.liquidationLtv);
+  if (liqLtv) parts.push(`Liq ${liqLtv}`);
   const borrowRate = formatPercent(position.borrowRate);
   if (borrowRate) parts.push(`Borrow ${borrowRate}`);
-  const deposited = formatUsd(position.deposited);
-  if (deposited) parts.push(`Deposited ${deposited}`);
   const detail = borrowRatesText(position);
   const hf = Number(position.healthFactor);
+  const color = severityColor(position.severity);
 
   return (
     <Cell
+      style={color ? { color } : undefined}
       subhead={position.platform || undefined}
       subtitle={parts.join(" · ") || undefined}
       description={detail || undefined}
@@ -116,10 +109,6 @@ function LendingCell({ position }) {
 }
 
 function PoolCell({ pool }) {
-  const value = formatUsd(pool.valueUsd);
-  const fees = formatUsd(pool.pendingFeesUsd);
-  const subtitle = [value, fees ? `Fees ${fees}` : null].filter(Boolean).join(" · ");
-
   let range = null;
   if (pool.isFullRange) {
     range = "Full range";
@@ -137,8 +126,7 @@ function PoolCell({ pool }) {
   return (
     <Cell
       subhead={pool.platform || undefined}
-      subtitle={subtitle || undefined}
-      description={range || undefined}
+      subtitle={range || undefined}
       after={pool.inRange != null ? <RangeBadge inRange={!!pool.inRange} /> : undefined}
     >
       {pool.pool || pool.platform || "Pool"}
@@ -173,21 +161,17 @@ function TronCells({ tron }) {
 }
 
 function WalletSection({ wallet }) {
-  const supplies = wallet.supplies || [];
   const lending = wallet.lending || [];
   const pools = wallet.pools || [];
   const errors = wallet.errors || [];
   const tron = wallet.tron || null;
   const isEmpty =
-    supplies.length === 0 && lending.length === 0 && pools.length === 0 && !tron && errors.length === 0;
+    lending.length === 0 && pools.length === 0 && !tron && errors.length === 0;
 
   const header = [shortAddress(wallet.address), wallet.protocol].filter(Boolean).join(" · ");
 
   return (
     <Section header={header}>
-      {supplies.map((supply, i) => (
-        <SupplyCell key={`supply-${i}`} supply={supply} />
-      ))}
       {lending.map((position, i) => (
         <LendingCell key={`lending-${i}`} position={position} />
       ))}
@@ -209,9 +193,33 @@ function WalletSection({ wallet }) {
   );
 }
 
+function PositionsSkeleton() {
+  const placeholderCell = (key) => (
+    <Cell
+      key={key}
+      subtitle="Loading…"
+      after={<Info type="text">—</Info>}
+    >
+      ●●●●●●
+    </Cell>
+  );
+  return (
+    <Skeleton visible>
+      <List>
+        <Section header="Scanning chains…">
+          {[0, 1, 2].map((i) => placeholderCell(`s0-${i}`))}
+        </Section>
+        <Section header="Scanning chains…">
+          {[0, 1].map((i) => placeholderCell(`s1-${i}`))}
+        </Section>
+      </List>
+    </Skeleton>
+  );
+}
+
 export default function Positions() {
   const [data, setData] = useState(cachedData);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(!cachedData);
   const [error, setError] = useState(null);
 
   async function refresh() {
@@ -228,15 +236,21 @@ export default function Positions() {
     }
   }
 
-  if (loading) {
-    return (
-      <Placeholder header="Scanning chains, ~30s" description="Fetching positions across all wallets">
-        <Spinner size="l" />
-      </Placeholder>
-    );
+  // Auto-load on first entry (no cached data yet). Switching tabs keeps the
+  // module-level cache, so this only fetches once per app session.
+  useEffect(() => {
+    if (!cachedData) {
+      refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Show the skeleton on the very first scan (no data to display yet).
+  if (loading && !data) {
+    return <PositionsSkeleton />;
   }
 
-  if (error) {
+  if (error && !data) {
     return (
       <Placeholder
         header="Failed to load positions"
@@ -250,39 +264,22 @@ export default function Positions() {
     );
   }
 
-  if (!data) {
-    return (
-      <Placeholder
-        header="Positions"
-        description="Refresh to scan your wallets across chains (takes ~30s)"
-        action={
-          <Button size="m" onClick={refresh}>
-            Refresh
-          </Button>
-        }
-      />
-    );
-  }
-
-  const totals = data.totals || {};
-  const wallets = data.wallets || [];
+  const wallets = data?.wallets || [];
 
   return (
     <List>
       <div style={{ padding: "12px 20px 0" }}>
-        <Button size="m" mode="bezeled" stretched onClick={refresh}>
-          Refresh
+        <Button size="m" mode="bezeled" stretched loading={loading} onClick={refresh}>
+          {loading ? "Scanning chains…" : "Refresh"}
         </Button>
       </div>
-      <Section header="Summary">
-        <Cell after={<Info type="text">{formatUsd(totals.supplyUsd) ?? "—"}</Info>}>
-          Total supplied
-        </Cell>
-        <Cell after={<Info type="text">{formatUsd(totals.lpValueUsd) ?? "—"}</Info>}>LP value</Cell>
-        <Cell after={<Info type="text">{formatUsd(totals.lpFeesUsd) ?? "—"}</Info>}>
-          Pending fees
-        </Cell>
-      </Section>
+      {error && (
+        <Section>
+          <Cell style={{ color: "var(--tgui--destructive_text_color)" }} subtitle={error}>
+            Refresh failed
+          </Cell>
+        </Section>
+      )}
       {wallets.length === 0 && (
         <Section>
           <Cell subtitle="Add wallets on the Wallets tab to start monitoring">No wallets yet</Cell>

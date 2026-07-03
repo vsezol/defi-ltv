@@ -1,6 +1,5 @@
-import { scanAllMarketsForWallet, getKaminoSupplies } from "./kamino.js";
-import { scanAaveMarketsForWallet, scanAaveSuppliesForWallet } from "./aave.js";
-import { getFluidSuppliesForWallet } from "./fluid.js";
+import { scanAllMarketsForWallet } from "./kamino.js";
+import { scanAaveMarketsForWallet } from "./aave.js";
 import { getOrcaPositionsForWallet } from "./orca.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, computeTronFlags } from "./tron.js";
@@ -14,8 +13,7 @@ export const DEFAULT_THRESHOLDS = {
   warningHealthFactor: 1.5,
   dangerHealthFactor: 1.3,
   warningBorrowRate: 10, // %
-  dangerBorrowRate: 15, // %
-  warningSupplyRate: 3 // % — alert when a deposit's APY drops below this
+  dangerBorrowRate: 15 // %
 };
 
 // User-configurable global defaults, falling back to code constants.
@@ -37,6 +35,25 @@ export function getWalletThresholds(user, wallet) {
     out[key] = w[key] ?? defaults[key];
   }
   return out;
+}
+
+// 0 = ok, 1 = warning, 2 = danger. Worst of the health-factor and borrow-rate checks.
+export function positionSeverity(thresholds, healthFactor, borrowRate) {
+  let level = 0;
+
+  const hf = parseFloat(healthFactor);
+  if (Number.isFinite(hf)) {
+    if (hf <= thresholds.dangerHealthFactor) level = Math.max(level, 2);
+    else if (hf <= thresholds.warningHealthFactor) level = Math.max(level, 1);
+  }
+
+  const br = parseFloat(borrowRate);
+  if (Number.isFinite(br)) {
+    if (br >= thresholds.dangerBorrowRate) level = Math.max(level, 2);
+    else if (br >= thresholds.warningBorrowRate) level = Math.max(level, 1);
+  }
+
+  return level;
 }
 
 function isEvmAddress(address) {
@@ -74,12 +91,11 @@ export function detectWalletType(address) {
   return "unknown";
 }
 
-// Both scanners return { positions, failures }. `failures` is a list of position-id
-// prefixes whose source (chain/network/vault) failed this scan — the alert checkers
-// use it to carry over previous state instead of pruning positions they couldn't
-// see, which would silently re-seed them later and swallow a threshold crossing.
-
-// LP positions (Orca for Solana wallets, Uniswap V3 for EVM wallets).
+// LP positions (Orca for Solana wallets, Uniswap V3 for EVM wallets). Returns
+// { positions, failures } — `failures` lists the id prefixes of sources
+// (chain/network) that failed this scan, so the alert checker can carry over
+// previous range state instead of pruning positions it couldn't see (pruning
+// would silently re-seed them on recovery and swallow a range crossing).
 export async function scanPoolsForWallet(wallet) {
   const walletType = detectWalletType(wallet);
   // Orca is a single source: a failure throws and the caller keeps all state.
@@ -88,30 +104,9 @@ export async function scanPoolsForWallet(wallet) {
   return { positions: [], failures: [] };
 }
 
-// Lending deposit (supply) positions: Kamino Earn for Solana, Aave + Fluid for EVM.
-export async function scanSuppliesForWallet(wallet) {
-  const walletType = detectWalletType(wallet);
-  if (walletType === "solana") return getKaminoSupplies(wallet);
-  if (walletType === "evm") {
-    const [aave, fluid] = await Promise.all([
-      scanAaveSuppliesForWallet(wallet),
-      getFluidSuppliesForWallet(wallet)
-    ]);
-    return {
-      positions: [...aave.positions, ...fluid.positions],
-      failures: [...aave.failures, ...fluid.failures]
-    };
-  }
-  return { positions: [], failures: [] };
-}
-
-export function isSupplyBelow(position, threshold) {
-  return Number.isFinite(position.supplyApy) && position.supplyApy < threshold;
-}
-
 // Scan a wallet and persist it. Returns what was found so the caller can render
 // it (Telegram reply or JSON). Throws with error.stage === "save" when scanning
-// succeeded but persisting failed.
+// succeeded but persisting failed. Lending and LP scans run concurrently.
 export async function addWalletCore(chatId, address, { onKaminoProgress } = {}) {
   const walletType = detectWalletType(address);
   if (walletType === "unknown") throw new Error("Unsupported wallet format");
@@ -124,49 +119,35 @@ export async function addWalletCore(chatId, address, { onKaminoProgress } = {}) 
       error.stage = "save";
       throw error;
     }
-    return { protocol: "tron", tron, positions: [], pools: [], supplies: [] };
+    return { protocol: "tron", tron, positions: [], pools: [] };
   }
 
   const protocol = walletType === "evm" ? "aave" : "kamino";
-  const positions =
+  const [positions, pools] = await Promise.all([
     protocol === "aave"
-      ? await scanAaveMarketsForWallet(address)
-      : await scanAllMarketsForWallet(address, onKaminoProgress);
+      ? scanAaveMarketsForWallet(address)
+      : scanAllMarketsForWallet(address, onKaminoProgress),
+    scanPoolsForWallet(address)
+      .then((r) => r.positions)
+      .catch((error) => {
+        logger.error({ address, error: error.message }, "Pool scan failed on add");
+        return [];
+      })
+  ]);
 
-  let pools = [];
-  try {
-    pools = (await scanPoolsForWallet(address)).positions;
-  } catch (error) {
-    logger.error({ address, error: error.message }, "Pool scan failed on add");
-  }
-  let supplies = [];
-  try {
-    supplies = (await scanSuppliesForWallet(address)).positions;
-  } catch (error) {
-    logger.error({ address, error: error.message }, "Supply scan failed on add");
+  if ((!positions || positions.length === 0) && pools.length === 0) {
+    return { protocol, empty: true, positions: [], pools: [] };
   }
 
-  if ((!positions || positions.length === 0) && pools.length === 0 && supplies.length === 0) {
-    return { protocol, empty: true, positions: [], pools: [], supplies: [] };
-  }
-
-  // Baseline the alert states silently — alerts fire only on later transitions.
-  // Must use the wallet-EFFECTIVE threshold (per-wallet overrides survive re-adds):
-  // baselining with the global default would make the next background cycle see a
-  // phantom transition whenever an override differs from the default.
-  const user = (await getUser(chatId)) || {};
-  const supplyThreshold = getWalletThresholds(user, address).warningSupplyRate;
+  // Baseline the LP range states silently — alerts fire only on later transitions.
   const poolStates = {};
   for (const pool of pools) poolStates[pool.id] = pool.inRange;
-  const supplyStates = {};
-  for (const supply of supplies) supplyStates[supply.id] = isSupplyBelow(supply, supplyThreshold);
 
   try {
     await upsertWallet(chatId, address, {
       protocol,
       markets: (positions || []).map((p) => p.market),
-      poolStates,
-      supplyStates
+      poolStates
     });
   } catch (error) {
     error.stage = "save";
@@ -174,8 +155,8 @@ export async function addWalletCore(chatId, address, { onKaminoProgress } = {}) 
   }
 
   logger.info(
-    { chatId, address, markets: (positions || []).length, pools: pools.length, supplies: supplies.length },
+    { chatId, address, markets: (positions || []).length, pools: pools.length },
     "Wallet added"
   );
-  return { protocol, positions: positions || [], pools, supplies };
+  return { protocol, positions: positions || [], pools };
 }

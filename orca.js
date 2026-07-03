@@ -103,9 +103,6 @@ export async function getOrcaPositionsForWallet(walletAddress) {
           whirlpool.tickCurrentIndex < p.position.tickUpperIndex
         : p.meta.currentPrice >= p.meta.lowerPrice && p.meta.currentPrice <= p.meta.upperPrice;
       const feePct = parseFloat((p.meta.feeRate / 10000).toFixed(4));
-      // balanceSnapshot is priced in the API's ref asset (USD): totalBalance =
-      // deployed liquidity value, totalYield = uncollected fees + rewards.
-      const snapshot = p.meta.balanceSnapshot;
       return {
         id: `orca:${p.address}`,
         platform: "orca",
@@ -115,9 +112,7 @@ export async function getOrcaPositionsForWallet(walletAddress) {
         upperPrice: p.meta.upperPrice,
         currentPrice: p.meta.currentPrice,
         priceLabel: `${sym(p.tokenB)} per ${sym(p.tokenA)}`,
-        isFullRange: !!p.meta.isFullRange,
-        valueUsd: parseFloat(snapshot?.totalBalance?.balanceInRefAsset),
-        pendingFeesUsd: parseFloat(snapshot?.totalYield?.balanceInRefAsset)
+        isFullRange: !!p.meta.isFullRange
       };
     });
 }

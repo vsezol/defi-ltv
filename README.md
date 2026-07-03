@@ -3,17 +3,11 @@
 Telegram bot that monitors your DeFi positions:
 
 - **Lending (borrow)** — Health Factor (HF), LTV and borrow rate on **Kamino**
-  (Solana) and **Aave V3** (Ethereum, Arbitrum, Base), alerting when a position
-  crosses your Warning/Danger threshold.
-- **Lending (deposits)** — supply positions and their APY on **Kamino Earn**
-  (kVaults, Solana), **Aave V3** and **Fluid** (Ethereum, Arbitrum, Base,
-  Polygon), alerting when a deposit's APY **drops below** your Warning Supply
-  APY threshold (and again when it recovers). Transition-only, like pool alerts.
+  (Solana) and **Aave V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a
+  position crosses your Warning/Danger threshold.
 - **LP pools** — concentrated-liquidity positions on **Orca** (Solana) and
   **Uniswap V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a position
-  goes **out of range** or comes back **in range**. Each position shows its
-  **deposited value and uncollected (pending) fees in USD**; `/checkall` adds a
-  total across all pools.
+  goes **out of range** or comes back **in range**.
 - **Tron resources** — staked **energy/bandwidth**, outgoing delegations and
   their reclaim dates, alerting when delegated resources become reclaimable or
   when free resources can be (re)delegated.
@@ -29,11 +23,9 @@ Telegram bot that monitors your DeFi positions:
 
 - Add a wallet — platforms are auto-detected from the address format
   (`0x…` → Aave + Uniswap V3, `T…` → Tron, Solana base58 → Kamino + Orca).
-- Every 10 minutes it re-checks lending/deposit/LP positions and pings you on
-  Telegram when:
+- Every 10 minutes it re-checks lending/LP positions and pings you on Telegram
+  when:
   - `HF ≤ Warning` **or** `borrow rate ≥ Warning` (lending), or
-  - a deposit's **supply APY crosses the Warning Supply APY threshold** (drops
-    below it, or recovers back above) — transition-only, or
   - an LP position **crosses the range boundary** (in ↔ out). Range alerts fire
     only on the transition, not repeatedly while it stays out of range.
 - Tron wallets are checked **hourly** (resource state changes slowly). Alerts
@@ -60,12 +52,11 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 | File | Purpose |
 | :--- | :--- |
 | `bot.js` | Entry point: Telegram bot, commands, menu, background check loop. |
-| `core.js` | Shared logic (bot + Mini App API): wallet type detection, thresholds/defaults, pool & supply scan dispatchers, add-wallet flow. |
-| `kamino.js` | Kamino lending positions + Kamino Earn (kVault) deposits via `https://api.kamino.finance`. |
-| `aave.js` | Aave V3 borrow + supply positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), with multi-RPC fallback. |
-| `fluid.js` | Fluid (Instadapp) lending deposits via `api.fluid.instadapp.io` (fToken positions + supply APR). |
+| `core.js` | Shared logic (bot + Mini App API): wallet type detection, thresholds/defaults, severity, LP scan dispatcher, add-wallet flow. |
+| `kamino.js` | Kamino borrow (obligation) positions via `https://api.kamino.finance`. |
+| `aave.js` | Aave V3 borrow positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), multi-RPC fallback with per-attempt timeout; all networks scanned in parallel. |
 | `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
-| `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback). |
+| `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback); networks and positions scanned in parallel. |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
 | `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by a fee-weighted score (30d vol/TVL × fee%) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |
 | `db.js` | PostgreSQL (`pg`): users + wallets, granular atomic per-row ops; schema bootstrap. |
@@ -106,9 +97,9 @@ npm run dev            # loads .env automatically (--env-file=.env)
 ## Mini App
 
 - Open it from the bot's **menu button** (set automatically when `WEBAPP_URL` is configured).
-- Three tabs: **Positions** (on-demand scan of everything: deposits, lending,
-  LP pools, Tron — with totals), **Wallets** (add one or many, remove),
-  **Settings** (global defaults + per-wallet threshold overrides).
+- Three tabs: **Positions** (auto-loads a scan of borrow positions, LP pool
+  ranges and Tron, with a loading skeleton), **Wallets** (add one or many,
+  remove), **Settings** (global defaults + per-wallet threshold overrides).
 - Auth: every `/api` request carries Telegram's signed `initData`; the server
   validates the HMAC with the bot token — no separate accounts.
 - Local dev: `npm run dev` (bot + API on :3000), `cd webapp && npx vite` (UI on

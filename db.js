@@ -31,8 +31,7 @@ const THRESHOLD_COLUMNS = {
   warningHealthFactor: "warning_hf",
   dangerHealthFactor: "danger_hf",
   warningBorrowRate: "warning_rate",
-  dangerBorrowRate: "danger_rate",
-  warningSupplyRate: "warning_supply_rate"
+  dangerBorrowRate: "danger_rate"
 };
 
 // CREATE TABLE IF NOT EXISTS doesn't add columns to existing tables, so every
@@ -99,7 +98,6 @@ function settingsFromRow(row) {
   if (row.danger_hf != null) settings.dangerHealthFactor = row.danger_hf;
   if (row.warning_rate != null) settings.warningBorrowRate = row.warning_rate;
   if (row.danger_rate != null) settings.dangerBorrowRate = row.danger_rate;
-  if (row.warning_supply_rate != null) settings.warningSupplyRate = row.warning_supply_rate;
   return settings;
 }
 
@@ -110,7 +108,6 @@ function assembleUser(userRow, walletRows) {
       protocol: w.protocol,
       markets: w.markets || [],
       poolStates: w.pool_states || {},
-      supplyStates: w.supply_states || {},
       settings: settingsFromRow(w),
       ...(w.tron_state ? { tronState: w.tron_state } : {})
     };
@@ -156,25 +153,23 @@ export async function getUserCount() {
 export async function upsertWallet(
   chatId,
   address,
-  { protocol, markets = [], poolStates = {}, supplyStates = {}, tronState = null }
+  { protocol, markets = [], poolStates = {}, tronState = null }
 ) {
   await pool.query("INSERT INTO users (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING", [chatId]);
   await pool.query(
-    `INSERT INTO wallets (chat_id, address, protocol, markets, pool_states, supply_states, tron_state)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb)
+    `INSERT INTO wallets (chat_id, address, protocol, markets, pool_states, tron_state)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
      ON CONFLICT (chat_id, address) DO UPDATE SET
-       protocol      = EXCLUDED.protocol,
-       markets       = EXCLUDED.markets,
-       pool_states   = EXCLUDED.pool_states,
-       supply_states = EXCLUDED.supply_states,
-       tron_state    = EXCLUDED.tron_state`,
+       protocol    = EXCLUDED.protocol,
+       markets     = EXCLUDED.markets,
+       pool_states = EXCLUDED.pool_states,
+       tron_state  = EXCLUDED.tron_state`,
     [
       chatId,
       address,
       protocol,
       JSON.stringify(markets),
       JSON.stringify(poolStates),
-      JSON.stringify(supplyStates),
       tronState ? JSON.stringify(tronState) : null
     ]
   );
@@ -206,8 +201,7 @@ export async function setWalletThreshold(chatId, address, field, value) {
 
 export async function resetWalletThresholds(chatId, address) {
   await pool.query(
-    `UPDATE wallets SET warning_hf = NULL, danger_hf = NULL, warning_rate = NULL, danger_rate = NULL,
-       warning_supply_rate = NULL
+    `UPDATE wallets SET warning_hf = NULL, danger_hf = NULL, warning_rate = NULL, danger_rate = NULL
      WHERE chat_id = $1 AND address = $2`,
     [chatId, address]
   );
@@ -224,14 +218,6 @@ export async function setWalletMarkets(chatId, address, markets) {
 // Column-scoped UPDATE (never upsert) — must not resurrect a wallet removed mid-scan.
 export async function setWalletPoolStates(chatId, address, states) {
   await pool.query("UPDATE wallets SET pool_states = $3::jsonb WHERE chat_id = $1 AND address = $2", [
-    chatId,
-    address,
-    JSON.stringify(states || {})
-  ]);
-}
-
-export async function setWalletSupplyStates(chatId, address, states) {
-  await pool.query("UPDATE wallets SET supply_states = $3::jsonb WHERE chat_id = $1 AND address = $2", [
     chatId,
     address,
     JSON.stringify(states || {})

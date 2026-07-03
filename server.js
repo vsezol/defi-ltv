@@ -8,7 +8,7 @@ import {
   getWalletThresholds,
   detectWalletType,
   scanPoolsForWallet,
-  scanSuppliesForWallet,
+  positionSeverity,
   addWalletCore
 } from "./core.js";
 import { checkSpecificMarkets } from "./kamino.js";
@@ -23,7 +23,7 @@ const isThresholdField = (field) => Object.prototype.hasOwnProperty.call(DEFAULT
 
 async function scanWalletPositions(user, wallet, walletData) {
   const protocol = walletData.protocol || "kamino";
-  const result = { address: wallet, protocol, lending: [], supplies: [], pools: [], tron: null, errors: [] };
+  const result = { address: wallet, protocol, lending: [], pools: [], tron: null, errors: [] };
 
   if (protocol === "tron") {
     try {
@@ -48,17 +48,11 @@ async function scanWalletPositions(user, wallet, walletData) {
             ...p
           }));
         }
+        for (const p of result.lending) {
+          p.severity = positionSeverity(thresholds, p.healthFactor, p.borrowRate);
+        }
       } catch (error) {
         result.errors.push(`Lending: ${error.message}`);
-      }
-    })(),
-    (async () => {
-      try {
-        const { positions, failures } = await scanSuppliesForWallet(wallet);
-        result.supplies = positions;
-        if (failures.length > 0) result.errors.push(`Supplies partial: ${failures.join(", ")} failed`);
-      } catch (error) {
-        result.errors.push(`Supplies: ${error.message}`);
       }
     })(),
     (async () => {
@@ -205,15 +199,7 @@ export function startWebServer(botToken) {
       const wallets = await Promise.all(
         entries.map(([wallet, walletData]) => scanWalletPositions(user, wallet, walletData))
       );
-      const totals = { supplyUsd: 0, lpValueUsd: 0, lpFeesUsd: 0 };
-      for (const w of wallets) {
-        for (const s of w.supplies) if (Number.isFinite(s.amountUsd)) totals.supplyUsd += s.amountUsd;
-        for (const p of w.pools) {
-          if (Number.isFinite(p.valueUsd)) totals.lpValueUsd += p.valueUsd;
-          if (Number.isFinite(p.pendingFeesUsd)) totals.lpFeesUsd += p.pendingFeesUsd;
-        }
-      }
-      res.json({ wallets, totals });
+      res.json({ wallets });
     })
   );
 

@@ -92,13 +92,24 @@ function createMarketClients(key, provider) {
   return { config, pool, ui };
 }
 
+// Per-attempt timeout: ethers has no default request timeout, so a hanging RPC
+// would block the whole fallback chain. Cap each attempt and move on fast.
+const RPC_ATTEMPT_TIMEOUT = 15000;
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`RPC timeout after ${ms}ms (${label})`)), ms))
+  ]);
+}
+
 export async function withRpcFallback(key, fn) {
   const urls = getRpcUrlsForNetwork(key);
   let lastError;
   for (const url of urls) {
     const provider = new providers.JsonRpcProvider(url);
     try {
-      return await fn(provider, url);
+      return await withTimeout(fn(provider, url), RPC_ATTEMPT_TIMEOUT, url);
     } catch (error) {
       lastError = error;
     }
@@ -204,86 +215,21 @@ async function getAavePositionsForNetwork(key, walletAddress) {
     });
 }
 
-const RAY = 1e27;
-const SECONDS_PER_YEAR = 31536000;
-
-// Supply (deposit) positions. Deliberately separate from the borrow flow:
-// getAavePositionsForNetwork early-returns [] when there's no debt, which is
-// exactly the supply-only case this scanner must catch.
-async function getAaveSuppliesForNetwork(key, walletAddress) {
-  const [userData, reservesData] = await withRpcFallback(key, async (provider) => {
-    const { config, ui } = createMarketClients(key, provider);
-    return Promise.all([
-      ui.getUserReservesHumanized({
-        lendingPoolAddressProvider: config.POOL_ADDRESSES_PROVIDER,
-        user: walletAddress
-      }),
-      ui.getReservesHumanized({
-        lendingPoolAddressProvider: config.POOL_ADDRESSES_PROVIDER
-      })
-    ]);
-  });
-
-  const reserveByAsset = new Map(
-    reservesData.reservesData.map((reserve) => [reserve.underlyingAsset.toLowerCase(), reserve])
-  );
-  const base = reservesData.baseCurrencyData;
-  const label = getNetworkConfig(key).label;
-
-  return userData.userReserves
-    .filter((reserve) => Number(reserve.scaledATokenBalance) > 0)
-    .map((reserve) => {
-      const info = reserveByAsset.get(reserve.underlyingAsset.toLowerCase());
-      if (!info) return null;
-      // scaledATokenBalance × liquidityIndex (ray) = underlying balance.
-      const amount =
-        (Number(reserve.scaledATokenBalance) / 10 ** info.decimals) * (Number(info.liquidityIndex) / RAY);
-      const priceUsd =
-        (Number(info.priceInMarketReferenceCurrency) / 10 ** base.marketReferenceCurrencyDecimals) *
-        (Number(base.marketReferenceCurrencyPriceInUsd) / 1e8);
-      // liquidityRate is the supply APR in ray; Aave compounds supply per second.
-      const apr = Number(info.liquidityRate) / RAY;
-      const apy = Math.pow(1 + apr / SECONDS_PER_YEAR, SECONDS_PER_YEAR) - 1;
-      return {
-        id: `aave:${key}:${info.symbol}`,
-        platform: "aave",
-        market: label,
-        asset: info.symbol,
-        amount,
-        amountUsd: amount * priceUsd,
-        supplyApy: Math.round(apy * 100 * 100) / 100
-      };
-    })
-    .filter(Boolean);
-}
-
-// Returns { positions, failures } — failures lists the id prefix of each network
-// whose scan failed, so callers can keep previous alert state instead of pruning.
-export async function scanAaveSuppliesForWallet(walletAddress) {
-  const positions = [];
-  const failures = [];
-  for (const network of NETWORKS) {
-    try {
-      positions.push(...(await getAaveSuppliesForNetwork(network.key, walletAddress)));
-    } catch (error) {
-      failures.push(`aave:${network.key}:`);
-      logger.error({ network: network.key, walletAddress, error: error.message }, "Aave supply scan failed");
-    }
-  }
-  return { positions, failures };
-}
-
+// All networks scanned concurrently — each hop is a slow multi-RPC-fallback
+// round-trip, so parallelizing turns the total from sum-of-networks into the
+// slowest single network.
 export async function scanAaveMarketsForWallet(walletAddress) {
-  const results = [];
-  for (const network of NETWORKS) {
-    try {
-      const positions = await getAavePositionsForNetwork(network.key, walletAddress);
-      results.push(...positions);
-    } catch (error) {
-      logger.error({ network: network.key, walletAddress, error: error.message }, "Aave scan failed");
-    }
-  }
-  return results;
+  const perNetwork = await Promise.all(
+    NETWORKS.map(async (network) => {
+      try {
+        return await getAavePositionsForNetwork(network.key, walletAddress);
+      } catch (error) {
+        logger.error({ network: network.key, walletAddress, error: error.message }, "Aave scan failed");
+        return [];
+      }
+    })
+  );
+  return perNetwork.flat();
 }
 
 export async function checkAaveMarkets(walletAddress) {
