@@ -5,9 +5,9 @@ Telegram bot that monitors your DeFi positions:
 - **Lending (borrow)** — Health Factor (HF), LTV and borrow rate on **Kamino**
   (Solana) and **Aave V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a
   position crosses your Warning/Danger threshold.
-- **LP pools** — concentrated-liquidity positions on **Orca** (Solana) and
-  **Uniswap V3** (Ethereum, Arbitrum, Base, Polygon), alerting when a position
-  goes **out of range** or comes back **in range**.
+- **LP pools** — concentrated-liquidity positions on **Orca** and **Meteora
+  DLMM** (Solana) and **Uniswap V3** (Ethereum, Arbitrum, Base, Polygon),
+  alerting when a position goes **out of range** or comes back **in range**.
 - **Tron resources** — staked **energy/bandwidth**, outgoing delegations and
   their reclaim dates, alerting when delegated resources become reclaimable or
   when free resources can be (re)delegated.
@@ -39,8 +39,8 @@ Telegram bot that monitors your DeFi positions:
 - Borrow rate is the borrow APY. For a Kamino position that borrows several
   assets, the **highest** asset borrow APY is used; for Aave it's the per-asset rate.
 - LP positions are discovered live on every check: Orca via the wallet's position
-  NFTs + Orca public API, Uniswap V3 via the NonfungiblePositionManager contract
-  on each chain.
+  NFTs + Orca public API, Meteora DLMM via the Meteora datapi, Uniswap V3 via the
+  NonfungiblePositionManager contract on each chain.
 
 Durable state (users, wallets, per-wallet settings) lives in **PostgreSQL**.
 Refetchable/ephemeral state (market caches, transient UI state) lives in a
@@ -56,6 +56,7 @@ The schema is created automatically on startup (`CREATE TABLE IF NOT EXISTS`).
 | `kamino.js` | Kamino borrow (obligation) positions via `https://api.kamino.finance`. |
 | `aave.js` | Aave V3 borrow positions on-chain (ethers v5 + `@aave/contract-helpers` + `@bgd-labs/aave-address-book`), multi-RPC fallback with per-attempt timeout; all networks scanned in parallel. |
 | `orca.js` | Orca Whirlpool LP positions: wallet position NFTs via Solana RPC + Orca public API. |
+| `meteora.js` | Meteora DLMM LP positions via the Meteora datapi (`dlmm.datapi.meteora.ag`) — positions by wallet, no RPC. |
 | `uniswap.js` | Uniswap V3 LP positions on-chain via NonfungiblePositionManager (reuses Aave RPC fallback); networks and positions scanned in parallel. |
 | `tron.js` | Tron account resources (energy/bandwidth), delegations and reclaim dates via TronGrid HTTP API. |
 | `toplp.js` | Top Uniswap v3/v4 LP pools (BTC/ETH vs stables) by a fee-weighted score (30d vol/TVL × fee%) across top EVM chains, via DefiLlama (chain TVL) + Uniswap GraphQL gateway (pools). |

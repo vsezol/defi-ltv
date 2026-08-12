@@ -1,6 +1,7 @@
 import { scanAllMarketsForWallet } from "./kamino.js";
 import { scanAaveMarketsForWallet } from "./aave.js";
 import { getOrcaPositionsForWallet } from "./orca.js";
+import { getMeteoraPositionsForWallet } from "./meteora.js";
 import { getUniswapPositionsForWallet } from "./uniswap.js";
 import { getTronResources, computeTronFlags } from "./tron.js";
 import { getUser, upsertWallet } from "./db.js";
@@ -91,15 +92,34 @@ export function detectWalletType(address) {
   return "unknown";
 }
 
-// LP positions (Orca for Solana wallets, Uniswap V3 for EVM wallets). Returns
+// LP positions (Orca + Meteora for Solana, Uniswap V3 for EVM). Returns
 // { positions, failures } — `failures` lists the id prefixes of sources
-// (chain/network) that failed this scan, so the alert checker can carry over
-// previous range state instead of pruning positions it couldn't see (pruning
-// would silently re-seed them on recovery and swallow a range crossing).
+// (orca:/meteora:/uniswap:<net>:) that failed this scan, so the alert checker can
+// carry over previous range state instead of pruning positions it couldn't see
+// (pruning would silently re-seed them on recovery and swallow a range crossing).
 export async function scanPoolsForWallet(wallet) {
   const walletType = detectWalletType(wallet);
-  // Orca is a single source: a failure throws and the caller keeps all state.
-  if (walletType === "solana") return { positions: await getOrcaPositionsForWallet(wallet), failures: [] };
+  if (walletType === "solana") {
+    // Two independent sources: a failure in one must not prune the other's state.
+    const [orca, meteora] = await Promise.all([
+      getOrcaPositionsForWallet(wallet)
+        .then((positions) => ({ positions }))
+        .catch((error) => {
+          logger.error({ wallet, error: error.message }, "Orca scan failed");
+          return { failure: "orca:" };
+        }),
+      getMeteoraPositionsForWallet(wallet)
+        .then((positions) => ({ positions }))
+        .catch((error) => {
+          logger.error({ wallet, error: error.message }, "Meteora scan failed");
+          return { failure: "meteora:" };
+        })
+    ]);
+    return {
+      positions: [...(orca.positions || []), ...(meteora.positions || [])],
+      failures: [orca.failure, meteora.failure].filter(Boolean)
+    };
+  }
   if (walletType === "evm") return getUniswapPositionsForWallet(wallet);
   return { positions: [], failures: [] };
 }

@@ -304,13 +304,14 @@ const PLATFORM_LABELS = {
   kamino: "*KAMINO*",
   aave: "*AAVE*",
   orca: "*ORCA*",
+  meteora: "*METEORA*",
   uniswap: "*UNISWAP*",
   tron: "*TRON*"
 };
 
 function formatResultsByWallet(resultsByWallet) {
   const output = [];
-  const protocolsOrder = ["kamino", "aave", "orca", "uniswap", "tron"];
+  const protocolsOrder = ["kamino", "aave", "orca", "meteora", "uniswap", "tron"];
   for (const [wallet, protocols] of resultsByWallet.entries()) {
     const protocolKeys = Object.keys(protocols);
     if (protocolKeys.length === 0) continue;
@@ -481,8 +482,11 @@ async function scanWalletForCheck(user, wallet, walletData, includePools) {
   if (poolError) {
     const platform = detectWalletType(wallet) === "solana" ? "orca" : "uniswap";
     buckets[platform] = [`Error: ${poolError}`];
-  } else if (pools.length > 0) {
-    buckets[pools[0].platform] = pools.map(p => formatPoolPosition(p));
+  } else {
+    // Group by platform — a Solana wallet can hold both Orca and Meteora positions.
+    for (const pool of pools) {
+      (buckets[pool.platform] ||= []).push(formatPoolPosition(pool));
+    }
   }
 
   return buckets;
